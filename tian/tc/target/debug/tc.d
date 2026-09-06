@@ -1,0 +1,1 @@
+/Users/samly/T/tian/tc/target/debug/tc: /Users/samly/T/tian/tc/src/ast.rs /Users/samly/T/tian/tc/src/gen_c.rs /Users/samly/T/tian/tc/src/gen_native.rs /Users/samly/T/tian/tc/src/lexer.rs /Users/samly/T/tian/tc/src/main.rs /Users/samly/T/tian/tc/src/parser.rs /Users/samly/T/tian/tc/src/tian_rt.c /Users/samly/T/tian/tc/src/type_check.rs
