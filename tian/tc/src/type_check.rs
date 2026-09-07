@@ -230,6 +230,14 @@ fn check_contracts(
                 }
             }
             Contract::Post(e, line) => {
+                // v4.6：@post 不支持元组返回值（元组不可比较/不可访问单个元素，规范 24.6）
+                // 从编译期拦截，杜绝后端静默跳过
+                if ret.is_tuple() {
+                    return Err(err(
+                        *line,
+                        "@post 不支持元组返回值（元组不可比较/不可访问单个元素，规范 24.6）",
+                    ));
+                }
                 let mut cs = base.clone();
                 cs.insert("ret".into(), VarInfo::new(ret, false));
                 let t = check_expr(e, &mut cs, funcs, structs, *line)?;
@@ -611,6 +619,16 @@ fn check_stmt(
                     *line,
                     format!(
                         "不能直接打印数组 '{}'（请打印元素如 `a[0]，或长度 `len(a)）",
+                        ty_label(t, structs)
+                    ),
+                ));
+            }
+            // v4.6：元组整体不可直接打印（元组仅存在于返回边界与解构，规范 24.2/24.5）
+            if t.is_tuple() {
+                return Err(err(
+                    *line,
+                    format!(
+                        "不能直接打印元组 '{}'（请用 destructuring `//a, b = f()` 后分别打印 a、b）",
                         ty_label(t, structs)
                     ),
                 ));
@@ -2109,5 +2127,50 @@ mod tests {
         assert!(e.contains("不符"), "实际报错：{}", e);
         // 未知锚点（解析期拦截）
         assert!(check_src("f/g():i64{\n@foo: 1\nr/ 1\n}\n").is_err());
+    }
+
+    #[test]
+    fn test_tuple_contract() {
+        // v4.6：元组 ret 的 @example 支持 (e1, e2) 字面量逐元素结构比较（规范 24.1 例外）
+        // 注意：语义锚点必须位于函数体首部（规范 12 节）；变量声明放在锚点之后。
+        assert!(
+            check_src(
+                "f/range_stats(n:i64):(i64, i64){\n@example: range_stats(3) -> (3, 6)\n//c=0\nr/n, n/2\n}\n"
+            )
+            .is_ok()
+        );
+        // 含 f64 元素
+        assert!(
+            check_src(
+                "f/div(a:i64,b:i64):(i64, f64){\n@example: div(5, 2) -> (2, 2.5)\nr/a, a/2.0\n}\n"
+            )
+            .is_ok()
+        );
+        // 含 str 元素
+        assert!(
+            check_src(
+                "f/pair(n:i64):(i64, str){\n@example: pair(5) -> (5, \"hi\")\nr/n, \"hi\"\n}\n"
+            )
+            .is_ok()
+        );
+        // @post 不支持元组返回（编译期拦截，规范 24.6）
+        let e = check_src(
+            "f/g(x:i64):(i64, i64){\n@post: true\nr/x, x\n}\n",
+        )
+        .unwrap_err();
+        assert!(e.contains("@post 不支持元组"), "实际报错：{}", e);
+    }
+
+    #[test]
+    fn test_tuple_rejected_positions() {
+        // v4.6 补漏：元组作实参
+        let e = check_src("f/g(a:i64){`a}\nf/h(a:i64,b:i64):(i64,i64){r/a,b}\ng(h(1,2))\n").unwrap_err();
+        assert!(e.contains("参数期望"), "tuple-as-arg 实际报错：{}", e);
+        // 元组直接打印
+        let e = check_src("f/h(a:i64,b:i64):(i64,i64){r/a,b}\n`h(1,2)\n").unwrap_err();
+        assert!(e.contains("不能"), "tuple-print 实际报错：{}", e);
+        // 元组作 sel 分支
+        let e = check_src("f/h(a:i64,b:i64):(i64,i64){r/a,b}\n`sel(true, h(1,2), h(2,3))\n").unwrap_err();
+        assert!(e.contains("sel"), "tuple-sel 实际报错：{}", e);
     }
 }

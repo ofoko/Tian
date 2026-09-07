@@ -506,6 +506,58 @@ fn compile_top(
         for f in &prog.funcs {
             for c in &f.contracts {
                 if let Contract::Example { call, expected, line } = c {
+                    // v4.6：元组返回 → 逐元素结构比较（规范 24.1 例外），避免退化为指针 icmp
+                    if let Some(Ty::Tuple(tid)) = emit_ty_of(call, &ctx) {
+                        let td = crate::type_check::tuples()[tid as usize].clone();
+                        let exp_elems = match expected {
+                            Expr::TupExpr { elems, .. } => elems,
+                            _ => unreachable!("元组 @example 期望值必须是元组字面量"),
+                        };
+                        let (cv, _) = emit_expr(call, &mut ctx, &mut builder)?;
+                        // 调用结果存入 FunctionBuilder 临时变量
+                        let var = Variable::from_u32(ctx.var_count);
+                        ctx.var_count += 1;
+                        builder.declare_var(var, ptr_ty());
+                        builder.def_var(var, cv);
+                        let mut all: Option<Value> = None;
+                        for (i, elem_ty) in td.elems.iter().enumerate() {
+                            let base = builder.use_var(var);
+                            let ev = load_field(&mut builder, base, (i as i32) * 8, *elem_ty)?;
+                            let xv = emit_bind_native(&exp_elems[i], &mut ctx, &mut builder)?;
+                            let cmp = match elem_ty {
+                                Ty::Str => {
+                                    let seq = ctx.rt.seq;
+                                    let sq = call_rt(
+                                        &mut ctx, &mut builder, seq, ptr_ty(), 2,
+                                        Some(types::I32), &[ev, xv],
+                                    )?
+                                    .ok_or("__t_seq 无返回值")?;
+                                    // __t_seq 返回 strcmp==0（相等为 1），故用 Ne 与 0 比较得到“是否相等”
+                                    let z = builder.ins().iconst(types::I32, 0);
+                                    builder.ins().icmp(IntCC::NotEqual, sq, z)
+                                }
+                                Ty::F64 => builder.ins().fcmp(FloatCC::Equal, ev, xv),
+                                _ => {
+                                    let a = coerce(&mut builder, ev, *elem_ty, Ty::I64)?;
+                                    let b = coerce(&mut builder, xv, *elem_ty, Ty::I64)?;
+                                    builder.ins().icmp(IntCC::Equal, a, b)
+                                }
+                            };
+                            all = Some(match all {
+                                None => cmp,
+                                Some(p) => builder.ins().band(p, cmp),
+                            });
+                        }
+                        let ok = all.ok_or("元组 @example 至少需要 1 个元素")?;
+                        let ok32 = builder.ins().uextend(types::I32, ok);
+                        let what = str_ptr(
+                            &mut ctx,
+                            &mut builder,
+                            &format!("@example 契约失败：{}（第 {} 行）", f.name, line),
+                        )?;
+                        let ck = ctx.rt.check;
+                        call_rt(&mut ctx, &mut builder, ck, types::I32, 2, None, &[ok32, what])?;
+                    } else {
                     let (cv, ct) = emit_expr(call, &mut ctx, &mut builder)?;
                     let (ev, _) = emit_expr(expected, &mut ctx, &mut builder)?;
                     let ok = if ct == Ty::Str {
@@ -530,6 +582,7 @@ fn compile_top(
                     )?;
                     let ck = ctx.rt.check;
                     call_rt(&mut ctx, &mut builder, ck, types::I32, 2, None, &[ok32, what])?;
+                    }
                 }
             }
         }

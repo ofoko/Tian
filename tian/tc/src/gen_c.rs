@@ -218,6 +218,46 @@ pub fn generate(prog: &Program) -> String {
         let frt = sigs[&f.name].ret;
         for c in &f.contracts {
             if let Contract::Example { call, expected, line } = c {
+                // v4.6：元组返回 → 逐元素结构比较（规范 24.1 例外），避免退化为指针比较
+                if frt.is_tuple() {
+                    let tid = match frt {
+                        Ty::Tuple(i) => i,
+                        _ => unreachable!(),
+                    };
+                    let td = crate::type_check::tuples()[tid as usize].clone();
+                    let exp_elems = match expected {
+                        Expr::TupExpr { elems, .. } => elems,
+                        _ => unreachable!("元组 @example 期望值必须是元组字面量（检查器已保证）"),
+                    };
+                    let mut call_s = String::new();
+                    emit_expr(call, &empty_scope, &sigs, &mut call_s);
+                    // 调用结果写入一次性临时指针，避免 call 求值两次
+                    // 用块作用域包裹 __t_res 临时指针，多个元组 @example 不冲突（v4.6 修复）
+                    let _ = writeln!(out, "{{");
+                    let _ = writeln!(out, "    void* __t_res = {};", call_s);
+                    let mut parts = Vec::new();
+                    for (i, elem_ty) in td.elems.iter().enumerate() {
+                        let mut exp_s = String::new();
+                        emit_bind(&exp_elems[i], &empty_scope, &sigs, &mut exp_s);
+                        let part = match elem_ty {
+                            // v4.6 修复：str 槽位以 long long 存储，读出转 const char* 作值比较
+                            Ty::Str => format!(
+                                "__t_seq(((const char*)((long long*)__t_res)[{}]), {})",
+                                i, exp_s
+                            ),
+                            Ty::F64 => format!("((double*)__t_res)[{}] == ({})", i, exp_s),
+                            _ => format!("((long long*)__t_res)[{}] == (long long)({})", i, exp_s),
+                        };
+                        parts.push(part);
+                    }
+                    let cond = parts.join(" && ");
+                    let _ = writeln!(
+                        out,
+                        "    if (!({})) {{ fprintf(stderr, \"@example 契约失败：{}（第 {} 行）\\n\"); exit(1); }}",
+                        cond, f.name, line
+                    );
+                    let _ = writeln!(out, "}}");
+                } else {
                 let mut call_s = String::new();
                 let mut exp_s = String::new();
                 emit_expr(call, &empty_scope, &sigs, &mut call_s);
@@ -234,6 +274,7 @@ pub fn generate(prog: &Program) -> String {
                     f.name,
                     line
                 );
+                }
             }
         }
     }
@@ -880,7 +921,9 @@ fn emit_stmt(
                     // v3.0：struct 返回值同样需要在返回位置将源变量置空
                     let needs_nulls = has_move_nulls(expr, is_owned(fn_ret), sigs);
                     indent(out, level);
-                    if is_owned(fn_ret) || needs_nulls || post.is_some() {
+                    // v4.6：元组返回走内部 malloc + 逐槽存储的 owned 分支（规范 24.3）；
+                    // is_owned(Tuple) 为 false，需显式让元组恒进该分支，避免落入非 owned 分支的 unreachable。
+                    if is_owned(fn_ret) || fn_ret.is_tuple() || needs_nulls || post.is_some() {
                         // 天权：返回前先求值到临时、置空被移动的源变量，再返回；
                         // v2.2：返回前内联校验 @post 出口契约
                         // v4.5：元组返回——malloc 块 + 逐元素存储（规范第 24 节）

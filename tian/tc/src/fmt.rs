@@ -417,7 +417,14 @@ pub fn format(prog: &Program) -> String {
                     out.push_str("@example: ");
                     fmt_expr(call, &mut out);
                     out.push_str(" -> ");
-                    fmt_expr(expected, &mut out);
+                    // v4.6：元组返回的 @example 期望值 (e1, e2) 必须带括号才能重新解析
+                    if matches!(expected, Expr::TupExpr { .. }) {
+                        out.push('(');
+                        fmt_expr(expected, &mut out);
+                        out.push(')');
+                    } else {
+                        fmt_expr(expected, &mut out);
+                    }
                     out.push('\n');
                 }
             }

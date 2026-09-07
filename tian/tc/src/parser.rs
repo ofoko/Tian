@@ -388,7 +388,13 @@ impl Parser {
                 "example" => {
                     let call = self.parse_expr()?;
                     self.expect(&Tok::Arrow)?;
-                    let expected = self.parse_expr()?;
+                    // v4.6：函数返回元组时，@example 期望值允许 (e1, e2) 元组字面量
+                    // 逐元素结构比较（规范 24.1 例外；仅返回边界，不引入元素访问）
+                    let expected = if let Some(Ty::Tuple(tid)) = self.ret_stack.last() {
+                        self.parse_tuple_literal_for_contract(*tid, line)?
+                    } else {
+                        self.parse_expr()?
+                    };
                     self.expect_newline()?;
                     contracts.push(Contract::Example { call, expected, line });
                 }
@@ -402,6 +408,47 @@ impl Parser {
             self.skip_newlines();
         }
         Ok(contracts)
+    }
+
+    /// v4.6：解析 @example 期望值的元组字面量 (e1, e2, ...)（规范 24.1 例外）。
+    /// 元素个数必须与返回元组类型一致；tuple id 直接取返回类型的 id，保证与 ret 类型一致。
+    fn parse_tuple_literal_for_contract(
+        &mut self,
+        tid: u32,
+        line: usize,
+    ) -> Result<Expr, ParseError> {
+        self.expect(&Tok::LParen)?;
+        let n = self
+            .tuples
+            .get(tid as usize)
+            .map(|t| t.elems.len())
+            .unwrap_or(0);
+        let mut elems = Vec::new();
+        self.skip_newlines();
+        while elems.len() < n {
+            if *self.peek() == Tok::Eof {
+                return Err(self.err(format!(
+                    "元组 @example 期望 {} 个元素，实际 {} 个",
+                    n,
+                    elems.len()
+                )));
+            }
+            if elems.len() > 0 {
+                self.expect(&Tok::Comma)?;
+                self.skip_newlines();
+            }
+            elems.push(self.parse_expr()?);
+            self.skip_newlines();
+        }
+        if *self.peek() == Tok::Comma {
+            return Err(self.err(format!(
+                "元组 @example 期望 {} 个元素，实际更多",
+                n
+            )));
+        }
+        self.expect(&Tok::RParen)?;
+        let _ = line;
+        Ok(Expr::TupExpr { elems, tup: tid })
     }
 
     fn parse_block(&mut self) -> Result<Vec<Stmt>, ParseError> {
