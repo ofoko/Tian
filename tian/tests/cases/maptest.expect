@@ -10,3 +10,7 @@ m3 has 1=true
 m4 name=Tian
 m4 len=1
 m5 pi=3.25
+m2 keys len=20, match len(m)=true
+m2 keys sum=2470
+m3 keys len=2
+m3 key values: one two 

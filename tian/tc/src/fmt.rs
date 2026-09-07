@@ -216,6 +216,12 @@ fn fmt_expr(e: &Expr, out: &mut String) {
             fmt_expr(key, out);
             out.push(')');
         }
+        // v4.7：keys(m) 键快照
+        Expr::Keys(map) => {
+            out.push_str("keys(");
+            fmt_expr(map, out);
+            out.push(')');
+        }
         // v4.7：del(m, k)（语句级）
         Expr::Del { map, key } => {
             out.push_str("del(");

@@ -41,3 +41,26 @@ m4["name"]="Tian"
 //m5=map[str]f64{}
 m5["pi"]=3.25
 ` "m5 pi="+tos(m5["pi"])
+
+# keys(m)：键快照 → []K 遍历（规范 25.4）
+# m2 键为 str → keys(m2) 为 []str；逐键取回 m2[key] 求和，校验遍历一致性
+//kc=keys(m2)
+` "m2 keys len="+tos(len(kc))+", match len(m)="+tos(len(kc)==len(m2))
+//tot=0
+//ki=0
+w/ki<len(kc){
+    tot=tot+m2[kc[ki]]
+    ki=ki+1
+}
+` "m2 keys sum="+tos(tot)
+
+# m3 键为 i64 → keys(m3) 为 []i64；逐键取回对应值并拼接（键哈希序确定，双后端一致）
+//kc3=keys(m3)
+` "m3 keys len="+tos(len(kc3))
+//kv=""
+//k3=0
+w/k3<len(kc3){
+    kv=kv+m3[kc3[k3]]+" "
+    k3=k3+1
+}
+` "m3 key values: "+kv

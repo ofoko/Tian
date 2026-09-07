@@ -23,3 +23,13 @@ counts=record(counts, "food")
 ` "has books: "+tos(has(counts, "books"))
 del(counts, "clothing")
 ` "after del clothing: "+tos(has(counts, "clothing"))+", total "+tos(len(counts))
+
+# keys(counts) → []str 键快照，遍历打印全部类目及频次
+//cats=keys(counts)
+` "--- all categories (keys traversal) ---"
+//ci=0
+w/ci<len(cats){
+    ` cats[ci]+" -> "+tos(counts[cats[ci]])
+    ci=ci+1
+}
+` "categories via keys(): "+tos(len(cats))

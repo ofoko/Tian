@@ -218,6 +218,8 @@ pub enum Expr {
     Has { map: Box<Expr>, key: Box<Expr> },
     /// v4.7 删除键：del(m, k)（语句级，规范第 25 节）
     Del { map: Box<Expr>, key: Box<Expr> },
+    /// v4.7 键快照：keys(m) → []K（返回新拥有的动态数组遍历用，规范 25.4）
+    Keys(Box<Expr>),
     /// v4.2 子串：sub(s, start, n)，产生新所有权的堆串（规范第 23 节）
     Sub {
         s: Box<Expr>,

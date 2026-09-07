@@ -21,7 +21,6 @@ pub fn parse(toks: Vec<(Tok, usize)>) -> Result<Program, ParseError> {
         pos: 0,
         structs: Vec::new(),
         arrs: Vec::new(),
-        darrs: Vec::new(),
         tuples: Vec::new(),
         ret_stack: Vec::new(),
         uses: Vec::new(),
@@ -30,6 +29,8 @@ pub fn parse(toks: Vec<(Tok, usize)>) -> Result<Program, ParseError> {
         visited: std::collections::HashSet::new(),
         saved: Vec::new(),
         maps: Vec::new(),
+        // v4.7：预注册 keys() 结果的基础 darr 类型（[]str、[]i64；map 键仅限这两种，规范 25.4）
+        darrs: Parser::seed_darrs(),
     }
     .parse_program()
 }
@@ -49,7 +50,6 @@ pub fn parse_file(path: &str) -> Result<Program, ParseError> {
         pos: 0,
         structs: Vec::new(),
         arrs: Vec::new(),
-        darrs: Vec::new(),
         tuples: Vec::new(),
         ret_stack: Vec::new(),
         uses: Vec::new(),
@@ -58,6 +58,7 @@ pub fn parse_file(path: &str) -> Result<Program, ParseError> {
         visited: std::collections::HashSet::from([canon]),
         saved: Vec::new(),
         maps: Vec::new(),
+        darrs: Parser::seed_darrs(),
     };
     p.parse_program()
 }
@@ -90,6 +91,11 @@ struct Parser {
 }
 
 impl Parser {
+    /// v4.7：keys() 返回的基础 darr 类型预注册（[]str、[]i64），确保键快照类型 id 恒有效（规范 25.4）
+    fn seed_darrs() -> Vec<DArrDef> {
+        vec![DArrDef { elem: Ty::Str }, DArrDef { elem: Ty::I64 }]
+    }
+
     fn peek(&self) -> &Tok {
         &self.toks[self.pos].0
     }
@@ -1138,6 +1144,10 @@ impl Parser {
                 if name == "len" {
                     // v3.3：len(a) 数组/字符串长度
                     return Ok(Expr::Len(Box::new(arg)));
+                }
+                // v4.7：keys(m) map 键快照 → []K（规范 25.4）
+                if name == "keys" {
+                    return Ok(Expr::Keys(Box::new(arg)));
                 }
                 Ok(Expr::Convert {
                     name,

@@ -194,6 +194,9 @@ struct Runtime {
     mfree_si: FuncId,
     mfree_sf: FuncId,
     mfree_ss: FuncId,
+    // v4.7：keys(m) 键快照
+    mkeys_i: FuncId,
+    mkeys_s: FuncId,
 }
 
 impl Runtime {
@@ -272,6 +275,8 @@ impl Runtime {
             mfree_si: mk("__t_mfree_si", vec![ptr_ty()], None),
             mfree_sf: mk("__t_mfree_sf", vec![ptr_ty()], None),
             mfree_ss: mk("__t_mfree_ss", vec![ptr_ty()], None),
+            mkeys_i: mk("__t_mkeys_i", vec![ptr_ty()], Some(ptr_ty())),
+            mkeys_s: mk("__t_mkeys_s", vec![ptr_ty()], Some(ptr_ty())),
         }
     }
 }
@@ -340,6 +345,12 @@ fn mhas_f(rt: &Runtime, m: &MapDef) -> FuncId {
     match m.key {
         Ty::Str => rt.mhas_s,
         _ => rt.mhas_i,
+    }
+}
+fn mkeys_f(rt: &Runtime, m: &MapDef) -> FuncId {
+    match m.key {
+        Ty::Str => rt.mkeys_s,
+        _ => rt.mkeys_i,
     }
 }
 fn mdef_of(t: Ty) -> MapDef {
@@ -1610,6 +1621,16 @@ fn emit_ty_of(e: &Expr, ctx: &FnCtx) -> Option<Ty> {
                 _ => None,
             }
         }
+        // v4.7：keys(m) → []K 键快照（emit_ty_of 内部推导，type_check 已通过）
+        Expr::Keys(map) => {
+            let bt = norm(emit_ty_of(map, ctx)?);
+            let ms = maps();
+            let m = map_by_id(&ms, bt)?;
+            darrs()
+                .iter()
+                .position(|d| d.elem == m.key)
+                .map(|i| Ty::DArr(i as u32))
+        }
     }
 }
 
@@ -2164,7 +2185,23 @@ fn emit_expr(
                 .ok_or("__t_mhas_* 无返回值")?;
             Ok((builder.ins().ireduce(types::I8, r), Ty::Bool))
         }
+
         Expr::Del { .. } => Err("del 只能作为语句（应被 type_check 拦截）".into()),
+        // v4.7：keys(m) → 新拥有的 []K 键快照（__t_mkeys_{keywire}；规范 25.4）
+        Expr::Keys(map) => {
+            let (bp, bt) = emit_expr(map, ctx, builder)?;
+            let md = map_by_id(&maps(), bt)
+                .cloned()
+                .ok_or("keys 实参必须是 map（应被 type_check 拦截）")?;
+            let f = mkeys_f(ctx.rt, &md);
+            let r = call_rt(ctx, builder, f, ptr_ty(), 1, Some(ptr_ty()), &[bp])?
+                .ok_or("__t_mkeys_* 无返回值")?;
+            let id = darrs()
+                .iter()
+                .position(|d| d.elem == md.key)
+                .ok_or("内部错误：map 键类型无对应动态数组")? as u32;
+            Ok((r, Ty::DArr(id)))
+        }
         // v4.5：元组表达式 → malloc 块 + 逐元素存储（每元素 8 字节槽，与 C 后端布局一致；规范第 24 节）
         Expr::TupExpr { elems, tup } => {
             let td = crate::type_check::tuples()[*tup as usize].clone();
