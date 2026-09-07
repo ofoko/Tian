@@ -619,8 +619,9 @@ fn emit_stmt(
                                 h = call_rt(ctx, builder, ctx.rt.dpush_f, types::F64, 2, Some(ptr_ty()), &[h, v])?
                                     .ok_or("__t_dpush_f 无返回值")?;
                             } else {
-                                let v = coerce(builder, v, vt, Ty::I64)?;
-                                h = call_rt(ctx, builder, ctx.rt.dpush_i, types::I64, 2, Some(ptr_ty()), &[h, v])?
+                                // v4.6：Bool 元素桥接为 I64（ABI 与 C 后端一致）
+                                let (v, abt) = coerce_darr_elem(builder, v, vt, de.elem)?;
+                                h = call_rt(ctx, builder, ctx.rt.dpush_i, abt, 2, Some(ptr_ty()), &[h, v])?
                                     .ok_or("__t_dpush_i 无返回值")?;
                             }
                         }
@@ -741,8 +742,9 @@ fn emit_stmt(
                                             h = call_rt(ctx, builder, ctx.rt.dpush_f, types::F64, 2, Some(ptr_ty()), &[h, v])?
                                                 .ok_or("__t_dpush_f 无返回值")?;
                                         } else {
-                                            let v = coerce(builder, v, vt, Ty::I64)?;
-                                            h = call_rt(ctx, builder, ctx.rt.dpush_i, types::I64, 2, Some(ptr_ty()), &[h, v])?
+                                            // v4.6：Bool 元素桥接为 I64（ABI 与 C 后端一致）
+                                            let (v, abt) = coerce_darr_elem(builder, v, vt, de.elem)?;
+                                            h = call_rt(ctx, builder, ctx.rt.dpush_i, abt, 2, Some(ptr_ty()), &[h, v])?
                                                 .ok_or("__t_dpush_i 无返回值")?;
                                         }
                                     }
@@ -766,7 +768,8 @@ fn emit_stmt(
                                 }
                             }
                         }
-                        emit_move_nulls_native(value, true, ctx, builder)?;
+                        // v4.6 修复：self_move（h=h）即自移动恒等，槽位原样保留——
+                        // 原先无条件 emit_move_nulls 把槽位清成 NULL，后续读取段错误
                         return Ok(());
                     }
                     // v3.3：数组整体赋值——拷贝语义，逐元素（规范 16.1）
@@ -861,7 +864,8 @@ fn emit_stmt(
                             let v = coerce(builder, v, vt, Ty::F64)?;
                             call_rt(ctx, builder, ctx.rt.dset_f, types::I64, 3, None, &[bp, i, v])?;
                         } else {
-                            let v = coerce(builder, v, vt, Ty::I64)?;
+                            // v4.6：Bool 元素桥接为 I64（ABI 与 C 后端一致）
+                            let (v, abt) = coerce_darr_elem(builder, v, vt, de.elem)?;
                             call_rt(ctx, builder, ctx.rt.dset_i, types::I64, 3, None, &[bp, i, v])?;
                         }
                         emit_move_nulls_native(value, false, ctx, builder)?;
@@ -923,6 +927,9 @@ fn emit_stmt(
             builder.seal_block(header);
             builder.switch_to_block(exit);
             builder.seal_block(exit);
+            // v4.6：exit 是新块；循环体内 break/continue 置位的截断标志在此复位，
+            // 否则后续 emit（含函数出口隐式 r/）误判当前块已终止
+            ctx.block_terminated = false;
             Ok(())
         }
         Stmt::If { cond, body, else_body, .. } => {
@@ -937,22 +944,32 @@ fn emit_stmt(
                     builder.switch_to_block(then_b);
                     builder.seal_block(then_b);
                     emit_block(ctx, builder, body, fn_ret)?;
-                    builder.ins().jump(merge, &[]);
+                    // v4.6：分支体可能以 break/continue/return/panic 截断（块已有终止符），
+                    // 不可再发 jump（Verifier：终止符后不得有指令）
+                    if !ctx.block_terminated {
+                        builder.ins().jump(merge, &[]);
+                    }
                     builder.switch_to_block(else_b);
                     builder.seal_block(else_b);
                     emit_block(ctx, builder, eb, fn_ret)?;
-                    builder.ins().jump(merge, &[]);
+                    if !ctx.block_terminated {
+                        builder.ins().jump(merge, &[]);
+                    }
                 }
                 None => {
                     builder.ins().brif(c, then_b, &[], merge, &[]);
                     builder.switch_to_block(then_b);
                     builder.seal_block(then_b);
                     emit_block(ctx, builder, body, fn_ret)?;
-                    builder.ins().jump(merge, &[]);
+                    if !ctx.block_terminated {
+                        builder.ins().jump(merge, &[]);
+                    }
                 }
             }
             builder.seal_block(merge);
             builder.switch_to_block(merge);
+            // v4.6：merge 是新块；分支体内的 break/continue/return 截断标志在此复位
+            ctx.block_terminated = false;
             Ok(())
         }
         Stmt::Return(e, _) => {
@@ -1008,15 +1025,15 @@ fn emit_stmt(
                 return Ok(());
             }
             let (v, vt) = emit_expr(value, ctx, builder)?;
-            let helper = if de.elem == Ty::F64 { ctx.rt.dpush_f } else { ctx.rt.dpush_i };
             if de.elem == Ty::F64 {
                 let v = coerce(builder, v, vt, Ty::F64)?;
-                let h = call_rt(ctx, builder, helper, types::F64, 2, Some(ptr_ty()), &[dst, v])?
+                let h = call_rt(ctx, builder, ctx.rt.dpush_f, types::F64, 2, Some(ptr_ty()), &[dst, v])?
                     .ok_or("__t_dpush_f 无返回值")?;
                 builder.def_var(var, h);
             } else {
-                let v = coerce(builder, v, vt, Ty::I64)?;
-                let h = call_rt(ctx, builder, helper, types::I64, 2, Some(ptr_ty()), &[dst, v])?
+                // v4.6：Bool 元素桥接为 I64（ABI 与 C 后端一致）
+                let (v, abt) = coerce_darr_elem(builder, v, vt, de.elem)?;
+                let h = call_rt(ctx, builder, ctx.rt.dpush_i, abt, 2, Some(ptr_ty()), &[dst, v])?
                     .ok_or("__t_dpush_i 无返回值")?;
                 builder.def_var(var, h);
             }
@@ -1077,8 +1094,8 @@ fn emit_stmt(
             let m = coerce(builder, mv, mt, Ty::Str)?;
             let panic_blk = builder.create_block();
             let ok_blk = builder.create_block();
-            let cv8 = builder.ins().uextend(types::I8, c);
-            builder.ins().brif(cv8, ok_blk, &[], panic_blk, &[]);
+            // v4.6 修复：c 已是 I8（Bool），brif 直接接受——同宽 uextend 非法
+            builder.ins().brif(c, ok_blk, &[], panic_blk, &[]);
             builder.seal_block(panic_blk);
             builder.seal_block(ok_blk);
             builder.switch_to_block(panic_blk);
@@ -1174,7 +1191,27 @@ fn coerce(builder: &mut FunctionBuilder, v: Value, from: Ty, to: Ty) -> Result<V
         (Ty::I32, Ty::I64) => Ok(builder.ins().sextend(types::I64, v)),
         (Ty::I32, Ty::F64) => Ok(builder.ins().fcvt_from_sint(types::F64, v)),
         (Ty::I64, Ty::F64) => Ok(builder.ins().fcvt_from_sint(types::F64, v)),
+        // v4.6：darr Bool 槽位按 I64 存储（与 C 后端一致），读回截断到 I8
+        (Ty::I64, Ty::Bool) => Ok(builder.ins().ireduce(types::I8, v)),
         _ => Err(format!("无法从 {:?} 转换到 {:?}（编译器内部错误）", from, to)),
+    }
+}
+
+/// v4.6：动态数组元素 → 运行时 ABI 值。Bool 元素以 I64 槽存储（__t_dpush_i/dset_i，
+/// 与 C 后端 long long 槽一致），I8 → I64 在调用点桥接（规范第 22 节）
+fn coerce_darr_elem(
+    builder: &mut FunctionBuilder,
+    v: Value,
+    vt: Ty,
+    elem: Ty,
+) -> Result<(Value, types::Type), String> {
+    if elem == Ty::F64 {
+        Ok((coerce(builder, v, vt, Ty::F64)?, types::F64))
+    } else if elem == Ty::Bool {
+        let b = coerce(builder, v, vt, Ty::Bool)?;
+        Ok((builder.ins().uextend(types::I64, b), types::I64))
+    } else {
+        Ok((coerce(builder, v, vt, Ty::I64)?, types::I64))
     }
 }
 
@@ -1188,7 +1225,8 @@ fn emit_ty_of(e: &Expr, ctx: &FnCtx) -> Option<Ty> {
         Expr::Var(name) => ctx.vars.get(name).map(|(_, t)| *t),
         // v3.3/v4.0：a[i] → 元素类型（定长或动态）
         Expr::Index(base, _) => {
-            let bt = emit_ty_of(base, ctx)?;
+            // v4.6 修复：借用 str（&str 形参 / @pre 锚点）同样支持字节读
+            let bt = norm(emit_ty_of(base, ctx)?);
             match bt {
                 Ty::Arr(i) => crate::type_check::arrs().get(i as usize).map(|a| a.elem),
                 Ty::DArr(i) => darrs().get(i as usize).map(|d| d.elem),
@@ -1238,6 +1276,8 @@ fn emit_ty_of(e: &Expr, ctx: &FnCtx) -> Option<Ty> {
         }
         Expr::Call { name, .. } => ctx.sigs.get(name).map(|s| s.ret),
         Expr::Convert { name, .. } if name == "tos" || name == "copy" => Some(Ty::Str),
+        // v4.6 修复：tof 返回 F64（此前被兜底为 I64，声明槽类型错配）
+        Expr::Convert { name, .. } if name == "tof" => Some(Ty::F64),
         Expr::Convert { .. } => Some(Ty::I64),
         Expr::Borrow(_) => Some(Ty::BorrowStr),
         // v3.0：结构体字面量 / 字段读取类型（规范第 14 节）
@@ -1700,6 +1740,11 @@ fn emit_expr(
                 }
                 let r = call_rt(ctx, builder, ctx.rt.dget_i, types::I64, 2, Some(types::I64), &[bp, i])?
                     .ok_or("__t_dget_i 无返回值")?;
+                // v4.6：Bool 槽位按 I64 存储，读回截断为 I8（与 cl_ty(Bool) 一致）
+                if de.elem == Ty::Bool {
+                    let b = builder.ins().ireduce(types::I8, r);
+                    return Ok((b, Ty::Bool));
+                }
                 return Ok((r, de.elem));
             }
             // v4.2：str 字节读（规范第 23 节）
@@ -1741,7 +1786,8 @@ fn emit_expr(
         // v4.2：sub(s, start, n) —— 运行时拷贝出新所有权的堆串（规范第 23 节）
         Expr::Sub { s, start, n } => {
             let (sv, st) = emit_expr(s, ctx, builder)?;
-            let sp = coerce(builder, sv, st, Ty::Str)?;
+            // v4.6 修复：借用 &str 在只读读取位视同 str（同 Bin 臂 norm 先例，规范 11.6.2）
+            let sp = if st == Ty::BorrowStr { sv } else { coerce(builder, sv, st, Ty::Str)? };
             let (iv, it) = emit_expr(start, ctx, builder)?;
             let i = coerce(builder, iv, it, Ty::I64)?;
             let (nv, nt) = emit_expr(n, ctx, builder)?;
@@ -1783,7 +1829,8 @@ fn emit_expr(
             if ct != Ty::Bool {
                 return Err("sel 条件必须是 bool（应被 type_check 拦截）".into());
             }
-            let cv8 = builder.ins().uextend(types::I8, cv);
+            // v4.6 修复：cv 已是 I8（Bool），brif 直接接受——同宽 uextend 非法
+            // （此前 sel 在原生后端从未真正编译过，一直被 C 回退掩盖）
             let (at, bt) = match emit_ty_of(a, ctx).zip(emit_ty_of(b, ctx)) {
                 Some((x, y)) => (norm(x), norm(y)),
                 None => return Err("sel 分支类型未知（编译器内部错误）".into()),
@@ -1794,7 +1841,7 @@ fn emit_expr(
             builder.append_block_param(merge, uty);
             let then_blk = builder.create_block();
             let else_blk = builder.create_block();
-            builder.ins().brif(cv8, then_blk, &[], else_blk, &[]);
+            builder.ins().brif(cv, then_blk, &[], else_blk, &[]);
             builder.seal_block(then_blk);
             builder.seal_block(else_blk);
             builder.switch_to_block(then_blk);
@@ -1940,8 +1987,8 @@ fn emit_expr(
         Expr::Convert { name, arg } => {
             let (v, t) = emit_expr(arg, ctx, builder)?;
             if name == "tof" {
-                // v4.4：tof(s)（规范第 7 节）
-                let sp = coerce(builder, v, t, Ty::Str)?;
+                // v4.4：tof(s)（规范第 7 节）；v4.6：借用 &str 只读位视同 str
+                let sp = if t == Ty::BorrowStr { v } else { coerce(builder, v, t, Ty::Str)? };
                 let r = call_rt(ctx, builder, ctx.rt.tof, ptr_ty(), 1, Some(types::F64), &[sp])?
                     .ok_or("__t_tof 无返回值")?;
                 return Ok((r, Ty::F64));

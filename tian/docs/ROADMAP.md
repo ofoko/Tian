@@ -22,7 +22,16 @@
 
 ### v4.6 元组生态收尾 + 验收工程化（小步快跑）
 
-- **首要：修复 3 个被 C 回退长期掩盖的 Cranelift Verifier bug**（run_tests.sh 首次全量原生构建即暴露）：`heap.t/sift_up`、`stats.t/is_num_char`、`sieve.t` 内函数。定位法按已知坑 #2：逐特性拆最小 .t 二分。修复后 run_tests.sh 的回退警告必须归零。
+- ~~**首要：修复 3 个被 C 回退长期掩盖的 Cranelift Verifier bug**~~ ✅ **已完成（2026-09-07），回退归零**。二分定位后确认实为 **9 个独立 bug**（远超登记的 3 个），全部被 C 回退掩盖多个版本：
+  1. `If` 臂发射块终止符后无条件补 `jump(merge)` → Verifier 报错（v3.8 break 引入）
+  2. `h=h` 自移动赋值仍执行置空 → darr 变量被清成 NULL → 段错误
+  3. `While`/`If` 汇合新块未复位 `block_terminated` → 循环漏发回边
+  4. `[]bool` 动态数组 4 条路径（字面量 push×2/赋值 push/dset/dget）缺 Bool↔I64 桥接
+  5. `sel` 同宽 `uextend(I8→I8)` 非法——**sel 原生后端从未真正编译过**
+  6. `check()` 同款同宽 uextend
+  7. `emit_ty_of` Index 臂不认识 BorrowStr（`@pre: s[i]==34` 内部错误）
+  8. `sub`/`tof` 借用实参缺"只读位视同 str"归一（coerce 无 BorrowStr→Str）
+  9. `emit_ty_of` Convert 兜底把 tof 推成 I64 → f64 声明槽类型错配
 - `@example` 支持元组**结构比较**：编译期解包逐元素比对（对拍 C/原生），**不引入元素访问语法**——坚守规范 24.1"仅返回边界"。
 - `@post` 对元组返回给出明确报错文案（当前静默跳过）。
 - 检查器补漏：元组作 `sel` 分支/字段/数组元素/打印的拦截用例补进单测。
