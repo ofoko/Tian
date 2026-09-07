@@ -1,0 +1,8 @@
+joined: 甲,乙,丙
+with-dash: 甲 - 乙 - 丙
+nospace: 甲乙丙
+one: only
+empty: []
+cats: a, b, c
+phrase: brown fox quick
+shortsep: 甲,乙,丙

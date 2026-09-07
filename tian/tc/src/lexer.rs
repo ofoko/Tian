@@ -498,6 +498,7 @@ impl Lexer {
             || word == "keys"
             || word == "values"
             || word == "sort"
+            || word == "cat"
         {
             return Ok(Tok::ConvertFn(word));
         }

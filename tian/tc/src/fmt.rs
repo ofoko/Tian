@@ -234,6 +234,14 @@ fn fmt_expr(e: &Expr, out: &mut String) {
             fmt_expr(arr, out);
             out.push(')');
         }
+        // v4.8：cat(a, sep) 连接动态数组为 str
+        Expr::Cat { arr, sep } => {
+            out.push_str("cat(");
+            fmt_expr(arr, out);
+            out.push_str(", ");
+            fmt_expr(sep, out);
+            out.push(')');
+        }
         // v4.7：del(m, k)（语句级）
         Expr::Del { map, key } => {
             out.push_str("del(");

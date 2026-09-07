@@ -1157,6 +1157,18 @@ impl Parser {
                         b: Box::new(b),
                     });
                 }
+                // v4.8：cat(arr, sep) []str 以 sep 连接 → 新 str（规范第 26 节）
+                if name == "cat" {
+                    self.expect(&Tok::LParen)?;
+                    let arr = self.parse_expr()?;
+                    self.expect(&Tok::Comma)?;
+                    let sep = self.parse_expr()?;
+                    self.expect(&Tok::RParen)?;
+                    return Ok(Expr::Cat {
+                        arr: Box::new(arr),
+                        sep: Box::new(sep),
+                    });
+                }
                 self.expect(&Tok::LParen)?;
                 let arg = self.parse_expr()?;
                 self.expect(&Tok::RParen)?;

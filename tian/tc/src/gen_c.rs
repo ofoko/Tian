@@ -240,6 +240,7 @@ pub fn generate(prog: &Program) -> String {
          static void __t_sort_i(void* h){ __t_darr_hdr* x=(__t_darr_hdr*)h; long long* b=(long long*)__t_darr_data(h); long long i,j; for(i=1;i<x->len;i++){ long long t=b[i]; j=i-1; while(j>=0 && b[j]>t){ b[j+1]=b[j]; j--; } b[j+1]=t; } }\n\
          static void __t_sort_f(void* h){ __t_darr_hdr* x=(__t_darr_hdr*)h; double* b=(double*)__t_darr_data(h); long long i,j; for(i=1;i<x->len;i++){ double t=b[i]; j=(long long)i-1; while(j>=0 && b[j]>t){ b[j+1]=b[j]; j--; } b[j+1]=t; } }\n\
          static void __t_sort_s(void* h){ __t_darr_hdr* x=(__t_darr_hdr*)h; char** b=(char**)__t_darr_data(h); long long i,j; for(i=1;i<x->len;i++){ char* t=b[i]; j=(long long)i-1; while(j>=0 && strcmp(b[j],t)>0){ b[j+1]=b[j]; j--; } b[j+1]=t; } }\n\
+         static char* __t_dcat_s(void* h, char* sep){ __t_darr_hdr* x=(__t_darr_hdr*)h; char** b=(char**)__t_darr_data(h); long long i; const char* s=sep?(const char*)sep:\"\"; size_t sl=strlen(s),tp=0; for(i=0;i<x->len;i++){ const char* v=b[i]?(const char*)b[i]:\"\"; tp+=v?strlen(v):0; } if(x->len>1) tp+=sl*(size_t)(x->len-1); char* r=(char*)malloc(tp+1); if(!r){fprintf(stderr,\"天运行时：内存分配失败\\n\");exit(1);} r[0]=0; for(i=0;i<x->len;i++){ if(i>0) strcat(r,s); const char* v=b[i]?(const char*)b[i]:\"\"; strcat(r,v?v:\"\"); } return r; }\n\
          static void __t_mfree_ii(void* h){ if(!h)return; __t_map_hdr* x=(__t_map_hdr*)h; for(long long i=0;i<x->cap;i++){ __t_mnode* n=__t_mbuckets(h)[i]; while(n){ __t_mnode* nx=n->next; free(n); n=nx; } } free(h); }\n\
          static void __t_mfree_if(void* h){ __t_mfree_ii(h); }\n\
          static void __t_mfree_is(void* h){ if(!h)return; __t_map_hdr* x=(__t_map_hdr*)h; for(long long i=0;i<x->cap;i++){ __t_mnode* n=__t_mbuckets(h)[i]; while(n){ __t_mnode* nx=n->next; free((void*)n->val); free(n); n=nx; } } free(h); }\n\
@@ -1590,6 +1591,15 @@ fn emit_expr(e: &Expr, scope: &Scope, sigs: &HashMap<String, FuncSig>, out: &mut
             out.push_str("), (long long)(");
             emit_expr(n, scope, sigs, out);
             out.push_str("))");
+        }
+        // v4.8：cat(arr, sep) → 新拥有 str（[]str 以 sep 连接；规范第 26 节）
+        Expr::Cat { arr, sep } => {
+            match arr.as_ref() {
+                Expr::Var(n) => out.push_str(&format!("__t_dcat_s({}, ", cname(n))),
+                _ => unreachable!("cat 第一个实参应为 darr 变量（检查器已拦截）"),
+            }
+            emit_expr(sep, scope, sigs, out);
+            out.push(')');
         }
         Expr::Push { .. } => unreachable!("push 只能作为语句（检查器已拦截）"),
         Expr::Pop { .. } => unreachable!("pop 只能作为语句（检查器已拦截）"),

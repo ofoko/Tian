@@ -205,6 +205,8 @@ struct Runtime {
     sort_i: FuncId,
     sort_f: FuncId,
     sort_s: FuncId,
+    // v4.8：cat []str → 新 str
+    dcat_s: FuncId,
 }
 
 impl Runtime {
@@ -293,6 +295,8 @@ impl Runtime {
             sort_i: mk("__t_sort_i", vec![ptr_ty()], None),
             sort_f: mk("__t_sort_f", vec![ptr_ty()], None),
             sort_s: mk("__t_sort_s", vec![ptr_ty()], None),
+            // v4.8：cat 两指针参（darr 句柄 + sep str），返新 str
+            dcat_s: mk("__t_dcat_s", vec![ptr_ty(), ptr_ty()], Some(ptr_ty())),
         }
     }
 }
@@ -1606,6 +1610,7 @@ fn emit_ty_of(e: &Expr, ctx: &FnCtx) -> Option<Ty> {
         Expr::Has { .. } => Some(Ty::Bool),
         Expr::Del { .. } => None,
         Expr::Sub { .. } => Some(Ty::Str),
+        Expr::Cat { .. } => Some(Ty::Str),
         // v4.5：元组表达式类型 = Ty::Tuple(tup)
         Expr::TupExpr { tup, .. } => Some(Ty::Tuple(*tup)),
         Expr::Push { .. } => None,
@@ -2216,6 +2221,19 @@ fn emit_expr(
             let nn = coerce(builder, nv, nt, Ty::I64)?;
             let r = call_rt(ctx, builder, ctx.rt.sub, types::I64, 3, Some(ptr_ty()), &[sp, i, nn])?
                 .ok_or("__t_sub 无返回值")?;
+            Ok((r, Ty::Str))
+        }
+        // v4.8：cat(arr, sep) → 新拥有 str（[]str 以 sep 连接；规范第 26 节）
+        Expr::Cat { arr, sep } => {
+            let (v, _) = match arr.as_ref() {
+                Expr::Var(n) => *ctx.vars.get(n).ok_or("cat 目标未声明（编译器内部错误）")?,
+                _ => return Err("cat 第一个实参必须是变量（应被 type_check 拦截）".into()),
+            };
+            let a = builder.use_var(v);
+            let (sv, st) = emit_expr(sep, ctx, builder)?;
+            let sp = if st == Ty::BorrowStr { sv } else { coerce(builder, sv, st, Ty::Str)? };
+            let r = call_rt(ctx, builder, ctx.rt.dcat_s, ptr_ty(), 2, Some(ptr_ty()), &[a, sp])?
+                .ok_or("__t_dcat_s 无返回值")?;
             Ok((r, Ty::Str))
         }
         Expr::DArrLit { .. } => Err("动态数组字面量位置非法（应被 type_check 拦截）".into()),

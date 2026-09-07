@@ -322,6 +322,25 @@ void __t_sort_s(void* h) {
     }
 }
 
+// join：[]str 以 sep 连接成新 str（空数组→空串；返回新拥有堆串）
+char* __t_dcat_s(void* h, char* sep) {
+    __t_darr_hdr* x = (__t_darr_hdr*)h;
+    char** b = (char**)__t_darr_data(h);
+    long long i;
+    const char* s = sep ? (const char*)sep : "";
+    size_t sl = strlen(s), total = 0;
+    for (i = 0; i < x->len; i++) total += strlen(b[i] ? b[i] : "");
+    if (x->len > 1) total += sl * (size_t)(x->len - 1);
+    char* r = (char*)malloc(total + 1);
+    if (!r) { fprintf(stderr, "天运行时：内存分配失败\n"); exit(1); }
+    r[0] = 0;
+    for (i = 0; i < x->len; i++) {
+        if (i > 0) strcat(r, s);
+        strcat(r, b[i] ? b[i] : "");
+    }
+    return r;
+}
+
 // has：命中 bool，未命中不 panic
 long long __t_mhas_i(void* h, long long k) { return __t_mfind_i(h, k) != NULL; }
 long long __t_mhas_s(void* h, const char* k) { return __t_mfind_s(h, k) != NULL; }

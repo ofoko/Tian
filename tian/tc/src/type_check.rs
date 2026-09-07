@@ -1281,6 +1281,7 @@ pub fn ty_of<S: TyLookup>(
         Expr::Has { .. } => Ok(Ty::Bool),
         // v4.7：del(m, k) 无值（仅语句级，规范第 25 节）
         Expr::Del { .. } => Err(err(0, "del 不产生值（只能作为语句）")),
+        Expr::Cat { .. } => Ok(Ty::Str),
         Expr::Sort { .. } => Err(err(0, "sort 不产生值（只能作为语句）")),
         // v4.0/v4.1：push/pop 无值（仅语句级，规范第 22 节）
         // v4.2：sub 产生新所有权的堆串
@@ -2026,6 +2027,31 @@ fn check_expr(
         }
         // v4.7：del(m, k) 是语句级（作表达式取值报错，规范第 25 节）
         Expr::Del { .. } => Err(err(line, "del 只能作为语句使用")),
+        // v4.8：cat(arr, sep) → 新拥有 str（[]str 以 sep 连接；规范第 26 节）
+        Expr::Cat { arr, sep } => {
+            let bn = match arr.as_ref() {
+                Expr::Var(bn) => bn,
+                _ => return Err(err(line, "cat 第一个实参必须是动态数组变量")),
+            };
+            let info = scope
+                .get(bn)
+                .ok_or_else(|| err(line, format!("变量 '{}' 未声明", bn)))?;
+            let table = darrs();
+            let de = darr_by_id(&table, info.ty).ok_or_else(|| {
+                err(line, format!("类型 {} 不是动态数组（cat 要求 []str）", ty_label(info.ty, structs)))
+            })?;
+            if de.elem != Ty::Str {
+                return Err(err(
+                    line,
+                    format!(" cat 仅支持 []str，实际 {}", ty_label(info.ty, structs)),
+                ));
+            }
+            let st = check_expr(sep, scope, funcs, structs, line)?;
+            if !value_assignable(Ty::Str, st, sep) {
+                return Err(err(line, format!("cat 分隔符期望 str，实际 {}", ty_label(st, structs))));
+            }
+            Ok(Ty::Str)
+        }
         // v4.8：sort(a) 是语句级（作表达式取值报错，规范第 26 节）
         Expr::Sort { .. } => Err(err(line, "sort 只能作为语句使用")),
         // v4.7：keys(m) → 新拥有的 []K 键快照（map 或 &map 均可；规范 25.4）

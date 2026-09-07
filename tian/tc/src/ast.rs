@@ -224,6 +224,8 @@ pub enum Expr {
     Values(Box<Expr>),
     /// v4.8：动态数组原地升序排序：sort(a)（[]i64/[]f64/[]str；语句级，规范第 26 节）
     Sort(Box<Expr>),
+    /// v4.8：动态数组 cat：cat(a, sep) → 新拥有 str（[]str 以 sep 连接，规范第 26 节）
+    Cat { arr: Box<Expr>, sep: Box<Expr> },
     /// v4.2 子串：sub(s, start, n)，产生新所有权的堆串（规范第 23 节）
     Sub {
         s: Box<Expr>,
