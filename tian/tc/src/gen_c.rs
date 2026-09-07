@@ -234,6 +234,9 @@ pub fn generate(prog: &Program) -> String {
          static void __t_mdel_ss(void* h, const char* k){ __t_map_hdr* x=(__t_map_hdr*)h; long long idx=__t_mhash_s(k)&(x->cap-1); __t_mnode** pp=&__t_mbuckets(h)[idx]; while(*pp){ if(!strcmp((char*)(*pp)->key,k)){ __t_mnode* t=*pp; *pp=t->next; free((void*)t->key); free((void*)t->val); free(t); x->len--; return; } pp=&(*pp)->next; } }\n\
          static void* __t_mkeys_i(void* h){ __t_map_hdr* x=(__t_map_hdr*)h; void* d=__t_dnew(x->cap); for(long long i=0;i<x->cap;i++){ __t_mnode* n=__t_mbuckets(h)[i]; while(n){ __t_dpush_i(d,n->key); n=n->next; } } return d; }\n\
          static void* __t_mkeys_s(void* h){ __t_map_hdr* x=(__t_map_hdr*)h; void* d=__t_dnew(x->cap); for(long long i=0;i<x->cap;i++){ __t_mnode* n=__t_mbuckets(h)[i]; while(n){ __t_dpush_s(d,__t_dup((char*)n->key)); n=n->next; } } return d; }\n\
+         static void* __t_mvalues_i(void* h){ __t_map_hdr* x=(__t_map_hdr*)h; void* d=__t_dnew(x->cap); for(long long i=0;i<x->cap;i++){ __t_mnode* n=__t_mbuckets(h)[i]; while(n){ __t_dpush_i(d,n->val); n=n->next; } } return d; }\n\
+         static void* __t_mvalues_f(void* h){ __t_map_hdr* x=(__t_map_hdr*)h; void* d=__t_dnew(x->cap); for(long long i=0;i<x->cap;i++){ __t_mnode* n=__t_mbuckets(h)[i]; while(n){ double v; memcpy(&v,&n->val,8); __t_dpush_f(d,v); n=n->next; } } return d; }\n\
+         static void* __t_mvalues_s(void* h){ __t_map_hdr* x=(__t_map_hdr*)h; void* d=__t_dnew(x->cap); for(long long i=0;i<x->cap;i++){ __t_mnode* n=__t_mbuckets(h)[i]; while(n){ __t_dpush_s(d,__t_dup((char*)n->val)); n=n->next; } } return d; }\n\
          static void __t_mfree_ii(void* h){ if(!h)return; __t_map_hdr* x=(__t_map_hdr*)h; for(long long i=0;i<x->cap;i++){ __t_mnode* n=__t_mbuckets(h)[i]; while(n){ __t_mnode* nx=n->next; free(n); n=nx; } } free(h); }\n\
          static void __t_mfree_if(void* h){ __t_mfree_ii(h); }\n\
          static void __t_mfree_is(void* h){ if(!h)return; __t_map_hdr* x=(__t_map_hdr*)h; for(long long i=0;i<x->cap;i++){ __t_mnode* n=__t_mbuckets(h)[i]; while(n){ __t_mnode* nx=n->next; free((void*)n->val); free(n); n=nx; } } free(h); }\n\
@@ -1521,6 +1524,22 @@ fn emit_expr(e: &Expr, scope: &Scope, sigs: &HashMap<String, FuncSig>, out: &mut
             out.push_str(&format!(
                 "__t_mkeys_{}({})",
                 map_key_wire(mde.key),
+                be
+            ));
+        }
+        // v4.7：values(m) → 新拥有的 []V 值快照（__t_mvalues_{valwire}；规范 25.4）
+        Expr::Values(map) => {
+            let bt = norm(ty_of(map, scope, sigs, &structs()).unwrap_or(Ty::I64));
+            let mde = crate::type_check::map_by_id(&crate::type_check::maps(), bt)
+                .expect("values() 目标应为 map（检查器已拦截）")
+                .clone();
+            let be = match map.as_ref() {
+                Expr::Var(n) => cname(n),
+                _ => unreachable!("values 实参只能是变量（检查器已拦截）"),
+            };
+            out.push_str(&format!(
+                "__t_mvalues_{}({})",
+                map_val_wire(mde.val),
                 be
             ));
         }

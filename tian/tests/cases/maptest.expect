@@ -14,3 +14,11 @@ m2 keys len=20, match len(m)=true
 m2 keys sum=2470
 m3 keys len=2
 m3 key values: one two 
+m1 values len=2, match len(m)=true
+m1 values sum=14
+m4 values len=1
+m4 values: Tian 
+m5 values len=1, pi=3.25
+m6 values len=2
+m6v[0]=false
+m6v[1]=true

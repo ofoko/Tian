@@ -64,3 +64,42 @@ w/k3<len(kc3){
     k3=k3+1
 }
 ` "m3 key values: "+kv
+
+# values(m)：值快照 → []V 遍历（规范 25.4）
+# m1 值为 i64 → values → []i64；逐元素求和校验一致性
+//v1=values(m1)
+` "m1 values len="+tos(len(v1))+", match len(m)="+tos(len(v1)==len(m1))
+//vt=0
+//vi=0
+w/vi<len(v1){
+    vt=vt+v1[vi]
+    vi=vi+1
+}
+` "m1 values sum="+tos(vt)
+
+# m4 值为 str → values → []str；逐元素拼接校验
+//v4=values(m4)
+` "m4 values len="+tos(len(v4))
+//vv=""
+//vi2=0
+w/vi2<len(v4){
+    vv=vv+v4[vi2]+" "
+    vi2=vi2+1
+}
+` "m4 values: "+vv
+
+# m5 值为 f64 → values → []f64
+//v5=values(m5)
+` "m5 values len="+tos(len(v5))+", pi="+tos(v5[0])
+
+# bool 值 → values → []bool
+//m6=map[str]bool{}
+m6["raining"]=true
+m6["sunny"]=false
+//vb=values(m6)
+` "m6 values len="+tos(len(vb))
+//bi=0
+w/bi<len(vb){
+    ` "m6v["+tos(bi)+"]="+tos(vb[bi])
+    bi=bi+1
+}

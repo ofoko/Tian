@@ -222,6 +222,12 @@ fn fmt_expr(e: &Expr, out: &mut String) {
             fmt_expr(map, out);
             out.push(')');
         }
+        // v4.7：values(m) 值快照
+        Expr::Values(map) => {
+            out.push_str("values(");
+            fmt_expr(map, out);
+            out.push(')');
+        }
         // v4.7：del(m, k)（语句级）
         Expr::Del { map, key } => {
             out.push_str("del(");

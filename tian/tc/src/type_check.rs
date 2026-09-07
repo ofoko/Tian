@@ -1269,6 +1269,18 @@ pub fn ty_of<S: TyLookup>(
                 .ok_or_else(|| err(0, "内部错误：map 键类型无对应动态数组"))? as u32;
             Ok(Ty::DArr(darr))
         }
+        // v4.7：values(m) → 新拥有的 []V 值快照（map 或 &map 均可；规范 25.4）
+        Expr::Values(map) => {
+            let bt = norm(ty_of(map, scope, funcs, structs)?);
+            let ms = maps();
+            let mde = map_by_id(&ms, bt)
+                .ok_or_else(|| err(0, format!("values() 实参必须是 map，实际 {}", ty_label(bt, structs))))?;
+            let darr = darrs()
+                .iter()
+                .position(|d| d.elem == mde.val)
+                .ok_or_else(|| err(0, "内部错误：map 值类型无对应动态数组"))? as u32;
+            Ok(Ty::DArr(darr))
+        }
         // v3.7：sel(cond, a, b) —— 仅数值/bool 分支；类型按提升规则统一（规范第 18 节）
         Expr::Sel { cond, a, b } => {
             let ct = norm(ty_of(cond, scope, funcs, structs)?);
@@ -1975,7 +1987,8 @@ fn check_expr(
             Ok(Ty::Bool)
         }
         // v4.7：del(m, k) 是语句级（作表达式取值报错，规范第 25 节）
-                // v4.7：keys(m) → 新拥有的 []K 键快照（map 或 &map 均可；规范 25.4）
+        Expr::Del { .. } => Err(err(line, "del 只能作为语句使用")),
+        // v4.7：keys(m) → 新拥有的 []K 键快照（map 或 &map 均可；规范 25.4）
         Expr::Keys(map) => {
             let bt = norm(check(map, scope)?);
             let ms = maps();
@@ -1988,7 +2001,19 @@ fn check_expr(
                 .ok_or_else(|| err(line, "内部错误：map 键类型无对应动态数组"))? as u32;
             Ok(Ty::DArr(id))
         }
-Expr::Del { .. } => Err(err(line, "del 只能作为语句使用")),
+        // v4.7：values(m) → 新拥有的 []V 值快照（map 或 &map 均可；规范 25.4）
+        Expr::Values(map) => {
+            let bt = norm(check(map, scope)?);
+            let ms = maps();
+            let m = map_by_id(&ms, bt).ok_or_else(|| {
+                err(line, format!("values() 实参必须是 map，实际 {}", ty_label(bt, structs)))
+            })?;
+            let id = darrs()
+                .iter()
+                .position(|d| d.elem == m.val)
+                .ok_or_else(|| err(line, "内部错误：map 值类型无对应动态数组"))? as u32;
+            Ok(Ty::DArr(id))
+        }
         // v3.5/v4.0：len —— 定长数组 / str / 动态数组
         Expr::Len(inner) => {
             let t = check(inner, scope)?;

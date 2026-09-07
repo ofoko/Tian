@@ -197,6 +197,10 @@ struct Runtime {
     // v4.7：keys(m) 键快照
     mkeys_i: FuncId,
     mkeys_s: FuncId,
+    // v4.7：values(m) 值快照（按值 wire 分派）
+    mvalues_i: FuncId,
+    mvalues_f: FuncId,
+    mvalues_s: FuncId,
 }
 
 impl Runtime {
@@ -277,6 +281,10 @@ impl Runtime {
             mfree_ss: mk("__t_mfree_ss", vec![ptr_ty()], None),
             mkeys_i: mk("__t_mkeys_i", vec![ptr_ty()], Some(ptr_ty())),
             mkeys_s: mk("__t_mkeys_s", vec![ptr_ty()], Some(ptr_ty())),
+            // v4.7：values —— 值快照，按值 wire 分派
+            mvalues_i: mk("__t_mvalues_i", vec![ptr_ty()], Some(ptr_ty())),
+            mvalues_f: mk("__t_mvalues_f", vec![ptr_ty()], Some(ptr_ty())),
+            mvalues_s: mk("__t_mvalues_s", vec![ptr_ty()], Some(ptr_ty())),
         }
     }
 }
@@ -351,6 +359,13 @@ fn mkeys_f(rt: &Runtime, m: &MapDef) -> FuncId {
     match m.key {
         Ty::Str => rt.mkeys_s,
         _ => rt.mkeys_i,
+    }
+}
+fn mvalues_f(rt: &Runtime, m: &MapDef) -> FuncId {
+    match mval_wire(m.val) {
+        "s" => rt.mvalues_s,
+        "f" => rt.mvalues_f,
+        _ => rt.mvalues_i,
     }
 }
 fn mdef_of(t: Ty) -> MapDef {
@@ -1631,6 +1646,16 @@ fn emit_ty_of(e: &Expr, ctx: &FnCtx) -> Option<Ty> {
                 .position(|d| d.elem == m.key)
                 .map(|i| Ty::DArr(i as u32))
         }
+        // v4.7：values(m) → []V 值快照（emit_ty_of 内部推导，type_check 已通过）
+        Expr::Values(map) => {
+            let bt = norm(emit_ty_of(map, ctx)?);
+            let ms = maps();
+            let m = map_by_id(&ms, bt)?;
+            darrs()
+                .iter()
+                .position(|d| d.elem == m.val)
+                .map(|i| Ty::DArr(i as u32))
+        }
     }
 }
 
@@ -2200,6 +2225,21 @@ fn emit_expr(
                 .iter()
                 .position(|d| d.elem == md.key)
                 .ok_or("内部错误：map 键类型无对应动态数组")? as u32;
+            Ok((r, Ty::DArr(id)))
+        }
+        // v4.7：values(m) → 新拥有的 []V 值快照（__t_mvalues_{valwire}；规范 25.4）
+        Expr::Values(map) => {
+            let (bp, bt) = emit_expr(map, ctx, builder)?;
+            let md = map_by_id(&maps(), bt)
+                .cloned()
+                .ok_or("values 实参必须是 map（应被 type_check 拦截）")?;
+            let f = mvalues_f(ctx.rt, &md);
+            let r = call_rt(ctx, builder, f, ptr_ty(), 1, Some(ptr_ty()), &[bp])?
+                .ok_or("__t_mvalues_* 无返回值")?;
+            let id = darrs()
+                .iter()
+                .position(|d| d.elem == md.val)
+                .ok_or("内部错误：map 值类型无对应动态数组")? as u32;
             Ok((r, Ty::DArr(id)))
         }
         // v4.5：元组表达式 → malloc 块 + 逐元素存储（每元素 8 字节槽，与 C 后端布局一致；规范第 24 节）

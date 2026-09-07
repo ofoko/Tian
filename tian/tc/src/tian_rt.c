@@ -258,6 +258,35 @@ void* __t_mkeys_s(void* h) {
     return d;
 }
 
+// values：值快照 → 新拥有的动态数组 []V（按值 wire 分派），str 值 dup 出数组自有副本
+void* __t_mvalues_i(void* h) {
+    __t_map_hdr* x = (__t_map_hdr*)h;
+    void* d = __t_dnew(x->cap);
+    for (long long i = 0; i < x->cap; i++) {
+        __t_mnode* n = __t_mbuckets(h)[i];
+        while (n) { __t_dpush_i(d, n->val); n = n->next; }
+    }
+    return d;
+}
+void* __t_mvalues_f(void* h) {
+    __t_map_hdr* x = (__t_map_hdr*)h;
+    void* d = __t_dnew(x->cap);
+    for (long long i = 0; i < x->cap; i++) {
+        __t_mnode* n = __t_mbuckets(h)[i];
+        while (n) { double v; memcpy(&v, &n->val, 8); __t_dpush_f(d, v); n = n->next; }
+    }
+    return d;
+}
+void* __t_mvalues_s(void* h) {
+    __t_map_hdr* x = (__t_map_hdr*)h;
+    void* d = __t_dnew(x->cap);
+    for (long long i = 0; i < x->cap; i++) {
+        __t_mnode* n = __t_mbuckets(h)[i];
+        while (n) { __t_dpush_s(d, __t_dup((char*)n->val)); n = n->next; }
+    }
+    return d;
+}
+
 // has：命中 bool，未命中不 panic
 long long __t_mhas_i(void* h, long long k) { return __t_mfind_i(h, k) != NULL; }
 long long __t_mhas_s(void* h, const char* k) { return __t_mfind_s(h, k) != NULL; }

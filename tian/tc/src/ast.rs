@@ -220,6 +220,8 @@ pub enum Expr {
     Del { map: Box<Expr>, key: Box<Expr> },
     /// v4.7 键快照：keys(m) → []K（返回新拥有的动态数组遍历用，规范 25.4）
     Keys(Box<Expr>),
+    /// v4.7 值快照：values(m) → []V（返回新拥有的动态数组遍历用，规范 25.4）
+    Values(Box<Expr>),
     /// v4.2 子串：sub(s, start, n)，产生新所有权的堆串（规范第 23 节）
     Sub {
         s: Box<Expr>,

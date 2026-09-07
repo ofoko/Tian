@@ -91,9 +91,16 @@ struct Parser {
 }
 
 impl Parser {
-    /// v4.7：keys() 返回的基础 darr 类型预注册（[]str、[]i64），确保键快照类型 id 恒有效（规范 25.4）
+    /// v4.7：keys()/values() 返回的基础 darr 类型预注册（键仅 []str、[]i64；值含 i32/i64/f64/bool/str），
+    /// 确保键/值快照类型 id 恒有效（规范 25.4）。顺序固定：现存 []str=[0]、[]i64=[1] 不位移。
     fn seed_darrs() -> Vec<DArrDef> {
-        vec![DArrDef { elem: Ty::Str }, DArrDef { elem: Ty::I64 }]
+        vec![
+            DArrDef { elem: Ty::Str },
+            DArrDef { elem: Ty::I64 },
+            DArrDef { elem: Ty::I32 },
+            DArrDef { elem: Ty::F64 },
+            DArrDef { elem: Ty::Bool },
+        ]
     }
 
     fn peek(&self) -> &Tok {
@@ -1148,6 +1155,10 @@ impl Parser {
                 // v4.7：keys(m) map 键快照 → []K（规范 25.4）
                 if name == "keys" {
                     return Ok(Expr::Keys(Box::new(arg)));
+                }
+                // v4.7：values(m) map 值快照 → []V（规范 25.4）
+                if name == "values" {
+                    return Ok(Expr::Values(Box::new(arg)));
                 }
                 Ok(Expr::Convert {
                     name,

@@ -33,3 +33,12 @@ w/ci<len(cats){
     ci=ci+1
 }
 ` "categories via keys(): "+tos(len(cats))
+
+# values(counts) → []i64 值快照，打印各频次
+//freq=values(counts)
+` "--- frequencies via values() ---"
+//fi=0
+w/fi<len(freq){
+    ` "cat["+tos(fi)+"]="+tos(freq[fi])
+    fi=fi+1
+}

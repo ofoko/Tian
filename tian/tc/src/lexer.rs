@@ -496,6 +496,7 @@ impl Lexer {
             || word == "has"
             || word == "del"
             || word == "keys"
+            || word == "values"
         {
             return Ok(Tok::ConvertFn(word));
         }
