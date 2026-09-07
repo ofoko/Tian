@@ -1,3 +1,4 @@
 .workbuddy/
 tian/tc/target/
 tian/*.o
+.DS_Store
