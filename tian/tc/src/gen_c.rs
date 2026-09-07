@@ -24,6 +24,8 @@ fn c_ty(t: Ty) -> String {
         }
         // v4.0：动态数组 = 堆指针（参与天权，规范第 22 节）
         Ty::DArr(_) => "void*".to_string(),
+        // v4.7：map = 堆指针（参与天权，规范第 25 节）
+        Ty::Map(_) => "void*".to_string(),
         // v4.5：元组 = 堆块指针（仅返回边界，规范第 24 节）
         Ty::Tuple(_) => "void*".to_string(),
         other => other.c_name().to_string(),
@@ -41,7 +43,30 @@ fn arr_of(t: Ty) -> (Ty, u64) {
     }
 }
 
-/// v3.0：释放一个堆值槽（str 用 __t_free，结构体用其深释放函数）
+/// v4.7：map 键类型 → wire 前缀（i64→i、str→s；规范第 25 节）
+fn map_key_wire(t: Ty) -> &'static str {
+    if t == Ty::Str {
+        "s"
+    } else {
+        "i"
+    }
+}
+
+/// v4.7：map 值类型 → wire 后缀（i32/i64/bool→i、f64→f、str→s；规范第 25 节）
+fn map_val_wire(t: Ty) -> &'static str {
+    match t {
+        Ty::Str => "s",
+        Ty::F64 => "f",
+        _ => "i",
+    }
+}
+
+/// v4.7：map 运行时函数后缀（mnew/mget/mhas/mset/mdel/mfree 共用），如 "ii"/"ss"/"if"
+fn map_wire(m: &MapDef) -> String {
+    format!("{}{}", map_key_wire(m.key), map_val_wire(m.val))
+}
+
+/// v4.7：释放一个 map 堆槽（深释放，__t_mfree_{suffix}；NULL 安全）
 fn free_slot(var_c: &str, t: Ty) -> String {
     match t {
         Ty::Struct(i) => {
@@ -57,6 +82,11 @@ fn free_slot(var_c: &str, t: Ty) -> String {
                 format!("__t_free({});", var_c)
             }
         }
+        // v4.7：map 整体深释放（NULL 安全，规范 25.7）
+        Ty::Map(i) => {
+            let m = crate::type_check::maps()[i as usize].clone();
+            format!("__t_mfree_{}({});", map_wire(&m), var_c)
+        }
         _ => format!("__t_free({});", var_c),
     }
 }
@@ -71,6 +101,59 @@ fn new_fn(sd: &StructDef) -> String {
     format!("__t_new_{}", cname(&sd.name))
 }
 
+/// v4.7：map 字面量构造代码块（规范第 25 节）。
+/// 发出 `{ void* __t_h = __t_mnew(8); 逐条目 __t_mset_{wire}(__t_h, k, v); tail }`。
+/// 每个条目：str 键/值走 emit_bind（字面量 dup / 变量移动），标量走 emit_expr。
+/// 块末 `tail` 由调用方给出（含换行前的两个空格缩进），通常为 `"{cn} = __t_h; }}"`。
+fn emit_map_ctor(
+    t: Ty,
+    entries: &[(Expr, Expr)],
+    scope: &Scope,
+    sigs: &HashMap<String, FuncSig>,
+    out: &mut String,
+    level: usize,
+    tail: &str,
+) {
+    let table = crate::type_check::maps();
+    let m = match t {
+        Ty::Map(i) => table[i as usize].clone(),
+        _ => unreachable!("emit_map_ctor 仅用于 map 类型"),
+    };
+    let kwire = map_key_wire(m.key);
+    let vwire = map_val_wire(m.val);
+    let suffix = map_wire(&m);
+    indent(out, level);
+    let _ = writeln!(out, "{{ void* __t_h = __t_mnew(8);");
+    for (k, v) in entries.iter() {
+        let mut ks = String::new();
+        let mut vs = String::new();
+        if kwire == "s" {
+            emit_bind(k, scope, sigs, &mut ks);
+        } else {
+            emit_expr(k, scope, sigs, &mut ks);
+        }
+        if vwire == "s" {
+            emit_bind(v, scope, sigs, &mut vs);
+        } else {
+            emit_expr(v, scope, sigs, &mut vs);
+        }
+        let key_arg = if kwire == "s" {
+            ks
+        } else {
+            format!("(long long)({})", ks)
+        };
+        let val_arg = if vwire == "s" || vwire == "f" {
+            vs
+        } else {
+            format!("(long long)({})", vs)
+        };
+        indent(out, level);
+        let _ = writeln!(out, "  __t_h = __t_mset_{}(__t_h, {}, {});", suffix, key_arg, val_arg);
+    }
+    indent(out, level);
+    let _ = writeln!(out, "  {}", tail);
+}
+
 /// 生成完整 C 源码
 pub fn generate(prog: &Program) -> String {
     let mut out = String::new();
@@ -79,6 +162,7 @@ pub fn generate(prog: &Program) -> String {
     crate::type_check::set_arrs(&prog.arrs);
     crate::type_check::set_darrs(&prog.darrs);
     crate::type_check::set_tuples(&prog.tuples);
+    crate::type_check::set_maps(&prog.maps);
 
     // 头部与运行时辅助函数
     out.push_str("/* 由 tc（Tian Compiler v2.0，天权）生成 */\n");
@@ -116,7 +200,44 @@ pub fn generate(prog: &Program) -> String {
          static char* __t_sub(const char* s, long long start, long long n){ long long len=(long long)strlen(s); if(start<0||n<0||start+n>len) __t_panic(\"子串越界\"); char* r=(char*)malloc((size_t)n+1); if(!r){fprintf(stderr,\"天运行时：内存分配失败\\n\");exit(1);} memcpy(r,s+start,(size_t)n); r[n]=0; return r; }\n\
          static int __t_idiv_i(int a, int b){ if(b==0) __t_panic(\"除数为零\"); return a/b; }\n\
          static long long __t_idiv_l(long long a, long long b){ if(b==0) __t_panic(\"除数为零\"); return a/b; }\n\
-         static void* __t_malloc(long long size){ void* p=malloc((size_t)size); if(!p){fprintf(stderr,\"天运行时：内存分配失败\\n\");exit(1);} return p; }\n\n",
+         static void* __t_malloc(long long size){ void* p=malloc((size_t)size); if(!p){fprintf(stderr,\"天运行时：内存分配失败\\n\");exit(1);} return p; }\n\
+         typedef struct __t_mnode{ long long hash; struct __t_mnode* next; long long key; long long val; } __t_mnode;\n\
+         typedef struct { long long len, cap; } __t_map_hdr;\n\
+         static __t_mnode** __t_mbuckets(void* h){ return (__t_mnode**)((char*)h + 16); }\n\
+         static long long __t_mhash_s(const char* s){ long long h=0xcbf29ce484222325; while(*s) h=(h^(unsigned char)*s++)*0x100000001b3ull; return h; }\n\
+         static long long __t_mhash_i(long long x){ x^=x>>33; x*=0xff51afd7ed558ccdull; x^=x>>33; x*=0xc4ceb9fe1a85ec53ull; x^=x>>33; return x; }\n\
+         static __t_mnode* __t_mfind_i(void* h, long long k){ __t_map_hdr* x=(__t_map_hdr*)h; __t_mnode* n=__t_mbuckets(h)[__t_mhash_i(k)&(x->cap-1)]; while(n&&n->key!=k)n=n->next; return n; }\n\
+         static __t_mnode* __t_mfind_s(void* h, const char* k){ __t_map_hdr* x=(__t_map_hdr*)h; __t_mnode* n=__t_mbuckets(h)[__t_mhash_s(k)&(x->cap-1)]; while(n&&strcmp((char*)n->key,k))n=n->next; return n; }\n\
+         static void* __t_mgrow(void* h){ __t_map_hdr* x=(__t_map_hdr*)h; long long oldcap=x->cap, newcap=oldcap*2; void* n=realloc(h,16+(size_t)newcap*8); if(!n){fprintf(stderr,\"天运行时：内存分配失败\\n\");exit(1);} ((__t_map_hdr*)n)->cap=newcap; __t_mnode** b=__t_mbuckets(n); memset(b+oldcap,0,(size_t)oldcap*8); for(long long i=0;i<oldcap;i++){ __t_mnode* cur=b[i]; b[i]=NULL; while(cur){ __t_mnode* nx=cur->next; long long j=cur->hash&(newcap-1); cur->next=b[j]; b[j]=cur; cur=nx; } } return n; }\n\
+         static __t_mnode* __t_mnode_new(void){ __t_mnode* n=(__t_mnode*)malloc(sizeof(__t_mnode)); if(!n){fprintf(stderr,\"天运行时：内存分配失败\\n\");exit(1);} return n; }\n\
+         static void* __t_mnew(long long cap){ if(cap<8)cap=8; void* h=malloc(16+(size_t)cap*8); if(!h){fprintf(stderr,\"天运行时：内存分配失败\\n\");exit(1);} ((__t_map_hdr*)h)->len=0; ((__t_map_hdr*)h)->cap=cap; memset(__t_mbuckets(h),0,(size_t)cap*8); return h; }\n\
+         static long long __t_mlen(void* h){ return ((__t_map_hdr*)h)->len; }\n\
+         static long long __t_mhas_i(void* h, long long k){ return __t_mfind_i(h,k)!=NULL; }\n\
+         static long long __t_mhas_s(void* h, const char* k){ return __t_mfind_s(h,k)!=NULL; }\n\
+         static long long __t_mget_ii(void* h, long long k){ __t_mnode* n=__t_mfind_i(h,k); if(!n)__t_panic(\"map 键不存在\"); return n->val; }\n\
+         static double __t_mget_if(void* h, long long k){ __t_mnode* n=__t_mfind_i(h,k); if(!n)__t_panic(\"map 键不存在\"); double d; memcpy(&d,&n->val,8); return d; }\n\
+         static char* __t_mget_is(void* h, long long k){ __t_mnode* n=__t_mfind_i(h,k); if(!n)__t_panic(\"map 键不存在\"); return (char*)n->val; }\n\
+         static long long __t_mget_si(void* h, const char* k){ __t_mnode* n=__t_mfind_s(h,k); if(!n)__t_panic(\"map 键不存在\"); return n->val; }\n\
+         static double __t_mget_sf(void* h, const char* k){ __t_mnode* n=__t_mfind_s(h,k); if(!n)__t_panic(\"map 键不存在\"); double d; memcpy(&d,&n->val,8); return d; }\n\
+         static char* __t_mget_ss(void* h, const char* k){ __t_mnode* n=__t_mfind_s(h,k); if(!n)__t_panic(\"map 键不存在\"); return (char*)n->val; }\n\
+         static void* __t_mset_ii(void* h, long long k, long long v){ __t_map_hdr* x=(__t_map_hdr*)h; __t_mnode* n=__t_mfind_i(h,k); if(n){n->val=v; return h;} if((x->len+1)*4>x->cap*3){h=__t_mgrow(h);x=(__t_map_hdr*)h;} long long hh=__t_mhash_i(k); __t_mnode* nn=__t_mnode_new(); nn->hash=hh; nn->key=k; nn->val=v; nn->next=__t_mbuckets(h)[hh&(x->cap-1)]; __t_mbuckets(h)[hh&(x->cap-1)]=nn; x->len++; return h; }\n\
+         static void* __t_mset_if(void* h, long long k, double v){ long long bits; memcpy(&bits,&v,8); return __t_mset_ii(h,k,bits); }\n\
+         static void* __t_mset_is(void* h, long long k, char* v){ __t_map_hdr* x=(__t_map_hdr*)h; __t_mnode* n=__t_mfind_i(h,k); if(n){free((void*)n->val);n->val=(long long)v;return h;} if((x->len+1)*4>x->cap*3){h=__t_mgrow(h);x=(__t_map_hdr*)h;} long long hh=__t_mhash_i(k); __t_mnode* nn=__t_mnode_new(); nn->hash=hh; nn->key=k; nn->val=(long long)v; nn->next=__t_mbuckets(h)[hh&(x->cap-1)]; __t_mbuckets(h)[hh&(x->cap-1)]=nn; x->len++; return h; }\n\
+         static void* __t_mset_si(void* h, char* k, long long v){ __t_map_hdr* x=(__t_map_hdr*)h; __t_mnode* n=__t_mfind_s(h,k); if(n){free(k);n->val=v;return h;} if((x->len+1)*4>x->cap*3){h=__t_mgrow(h);x=(__t_map_hdr*)h;} long long hh=__t_mhash_s(k); __t_mnode* nn=__t_mnode_new(); nn->hash=hh; nn->key=(long long)k; nn->val=v; nn->next=__t_mbuckets(h)[hh&(x->cap-1)]; __t_mbuckets(h)[hh&(x->cap-1)]=nn; x->len++; return h; }\n\
+         static void* __t_mset_sf(void* h, char* k, double v){ long long bits; memcpy(&bits,&v,8); return __t_mset_si(h,k,bits); }\n\
+         static void* __t_mset_ss(void* h, char* k, char* v){ __t_map_hdr* x=(__t_map_hdr*)h; __t_mnode* n=__t_mfind_s(h,k); if(n){free(k);free((void*)n->val);n->val=(long long)v;return h;} if((x->len+1)*4>x->cap*3){h=__t_mgrow(h);x=(__t_map_hdr*)h;} long long hh=__t_mhash_s(k); __t_mnode* nn=__t_mnode_new(); nn->hash=hh; nn->key=(long long)k; nn->val=(long long)v; nn->next=__t_mbuckets(h)[hh&(x->cap-1)]; __t_mbuckets(h)[hh&(x->cap-1)]=nn; x->len++; return h; }\n\
+         static void __t_mdel_ii(void* h, long long k){ __t_map_hdr* x=(__t_map_hdr*)h; long long idx=__t_mhash_i(k)&(x->cap-1); __t_mnode** pp=&__t_mbuckets(h)[idx]; while(*pp){ if((*pp)->key==k){ __t_mnode* t=*pp; *pp=t->next; free(t); x->len--; return; } pp=&(*pp)->next; } }\n\
+         static void __t_mdel_if(void* h, long long k){ __t_mdel_ii(h,k); }\n\
+         static void __t_mdel_is(void* h, long long k){ __t_map_hdr* x=(__t_map_hdr*)h; long long idx=__t_mhash_i(k)&(x->cap-1); __t_mnode** pp=&__t_mbuckets(h)[idx]; while(*pp){ if((*pp)->key==k){ __t_mnode* t=*pp; *pp=t->next; free((void*)t->val); free(t); x->len--; return; } pp=&(*pp)->next; } }\n\
+         static void __t_mdel_si(void* h, const char* k){ __t_map_hdr* x=(__t_map_hdr*)h; long long idx=__t_mhash_s(k)&(x->cap-1); __t_mnode** pp=&__t_mbuckets(h)[idx]; while(*pp){ if(!strcmp((char*)(*pp)->key,k)){ __t_mnode* t=*pp; *pp=t->next; free((void*)t->key); free(t); x->len--; return; } pp=&(*pp)->next; } }\n\
+         static void __t_mdel_sf(void* h, const char* k){ __t_mdel_si(h,k); }\n\
+         static void __t_mdel_ss(void* h, const char* k){ __t_map_hdr* x=(__t_map_hdr*)h; long long idx=__t_mhash_s(k)&(x->cap-1); __t_mnode** pp=&__t_mbuckets(h)[idx]; while(*pp){ if(!strcmp((char*)(*pp)->key,k)){ __t_mnode* t=*pp; *pp=t->next; free((void*)t->key); free((void*)t->val); free(t); x->len--; return; } pp=&(*pp)->next; } }\n\
+         static void __t_mfree_ii(void* h){ if(!h)return; __t_map_hdr* x=(__t_map_hdr*)h; for(long long i=0;i<x->cap;i++){ __t_mnode* n=__t_mbuckets(h)[i]; while(n){ __t_mnode* nx=n->next; free(n); n=nx; } } free(h); }\n\
+         static void __t_mfree_if(void* h){ __t_mfree_ii(h); }\n\
+         static void __t_mfree_is(void* h){ if(!h)return; __t_map_hdr* x=(__t_map_hdr*)h; for(long long i=0;i<x->cap;i++){ __t_mnode* n=__t_mbuckets(h)[i]; while(n){ __t_mnode* nx=n->next; free((void*)n->val); free(n); n=nx; } } free(h); }\n\
+         static void __t_mfree_si(void* h){ if(!h)return; __t_map_hdr* x=(__t_map_hdr*)h; for(long long i=0;i<x->cap;i++){ __t_mnode* n=__t_mbuckets(h)[i]; while(n){ __t_mnode* nx=n->next; free((void*)n->key); free(n); n=nx; } } free(h); }\n\
+         static void __t_mfree_sf(void* h){ __t_mfree_si(h); }\n\
+         static void __t_mfree_ss(void* h){ if(!h)return; __t_map_hdr* x=(__t_map_hdr*)h; for(long long i=0;i<x->cap;i++){ __t_mnode* n=__t_mbuckets(h)[i]; while(n){ __t_mnode* nx=n->next; free((void*)n->key); free((void*)n->val); free(n); n=nx; } } free(h); }\n\n",
     );
 
     // v3.0：结构体类型定义 + 构造函数 + 深释放（规范第 14 节）
@@ -371,7 +492,7 @@ pub fn generate(prog: &Program) -> String {
             Ty::Struct(_) => "NULL",
             Ty::BorrowStr => unreachable!("借用不可作为返回类型（检查器已拦截）"),
             Ty::Arr(_) => unreachable!("定长数组不可作为返回类型（检查器已拦截）"),
-            Ty::DArr(_) | Ty::Tuple(_) => "NULL",
+            Ty::DArr(_) | Ty::Tuple(_) | Ty::Map(_) => "NULL",
         };
         match &post {
             Some((pexpr, cline)) => {
@@ -627,6 +748,33 @@ fn emit_stmt(
                 }
                 return;
             }
+            // v4.7：map 声明——堆指针，天权移动语义（规范第 25 节）
+            if t.is_map() {
+                let cn = cname(name);
+                match value {
+                    Expr::MapLit { entries, .. } => {
+                        emit_map_ctor(
+                            t,
+                            entries,
+                            scope,
+                            sigs,
+                            out,
+                            level,
+                            &format!("{} = __t_h; }}", cn),
+                        );
+                        emit_move_nulls(value, true, scope, sigs, out, level);
+                    }
+                    _ => {
+                        // Var 移动或函数返回：直接接管新指针（槽已 NULL 化，规范 25.7）
+                        let mut e = String::new();
+                        emit_expr(value, scope, sigs, &mut e);
+                        indent(out, level);
+                        let _ = writeln!(out, "{} = {};", cn, e);
+                        emit_move_nulls(value, true, scope, sigs, out, level);
+                    }
+                }
+                return;
+            }
             let mut e = String::new();
             if t == Ty::Str {
                 emit_bind(value, scope, sigs, &mut e);
@@ -657,6 +805,46 @@ fn emit_stmt(
             // v4.0：动态数组下标赋值 a[i] = e —— __t_dset_* 守卫（规范第 22 节）
             if let Expr::Index(base, idx) = target {
                 let bt = norm(ty_of(base, scope, sigs, &structs()).unwrap_or(Ty::I64));
+                // v4.7：map 下标赋值 m[k] = e —— __t_mset_* 可能 realloc，变量重绑（规范第 25 节）
+                if let Some(mde) = crate::type_check::map_by_id(&crate::type_check::maps(), bt) {
+                    let be = match base.as_ref() {
+                        Expr::Var(n) => cname(n),
+                        _ => String::new(),
+                    };
+                    let mut ks = String::new();
+                    emit_expr(idx, scope, sigs, &mut ks);
+                    let mut vs = String::new();
+                    if map_val_wire(mde.val) == "s" {
+                        emit_bind(value, scope, sigs, &mut vs);
+                    } else {
+                        emit_expr(value, scope, sigs, &mut vs);
+                    }
+                    let key_arg = if map_key_wire(mde.key) == "s" {
+                        // v4.7：mset 接管键所有权——字面量/变量统一 dup 出 map 自有副本（规范第 25 节）
+                        format!("__t_dup({})", ks)
+                    } else {
+                        format!("(long long)({})", ks)
+                    };
+                    let val_arg = if matches!(map_val_wire(mde.val), "s" | "f") {
+                        vs
+                    } else {
+                        format!("(long long)({})", vs)
+                    };
+                    let suffix = map_wire(&mde.clone());
+                    indent(out, level);
+                    let _ = writeln!(
+                        out,
+                        "{} = __t_mset_{}({}, {}, {});",
+                        be, suffix, be, key_arg, val_arg
+                    );
+                    // str 值：@set 整体移动语义，源 str 被消费（字面量 dup / 变量移动）
+                    if map_val_wire(mde.val) == "s" {
+                        emit_move_nulls(value, true, scope, sigs, out, level);
+                    } else {
+                        emit_move_nulls(value, false, scope, sigs, out, level);
+                    }
+                    return;
+                }
                 if let Some(de) = crate::type_check::darr_by_id(&crate::type_check::darrs(), bt) {
                     let be = match base.as_ref() {
                         Expr::Var(n) => cname(n),
@@ -715,6 +903,38 @@ fn emit_stmt(
                 }
                 _ => unreachable!("类型检查已拦截非法赋值左侧"),
             };
+            // v4.7：map 整体赋值——移动语义（释放旧值除非自我消费，规范 25.7）
+            if t.is_map() {
+                let cn = cn;
+                let consumed = target_var
+                    .as_ref()
+                    .map_or(false, |n| consumes_var(value, n, true, sigs));
+                match value {
+                    Expr::MapLit { entries, .. } => {
+                        let tail = if !consumed {
+                            format!("{}\n  {} = __t_h; }}", free_slot(&cn, t), cn)
+                        } else {
+                            format!("{} = __t_h; }}", cn)
+                        };
+                        emit_map_ctor(t, entries, scope, sigs, out, level, &tail);
+                        emit_move_nulls(value, true, scope, sigs, out, level);
+                    }
+                    _ => {
+                        let mut e = String::new();
+                        emit_expr(value, scope, sigs, &mut e);
+                        indent(out, level);
+                        let _ = writeln!(out, "{{ void* __t_h = {};", e);
+                        emit_move_nulls(value, true, scope, sigs, out, level);
+                        indent(out, level);
+                        if !consumed {
+                            let _ = writeln!(out, "  {}", free_slot(&cn, t));
+                        }
+                        indent(out, level);
+                        let _ = writeln!(out, "  {} = __t_h; }}", cn);
+                    }
+                }
+                return;
+            }
             // v4.0：动态数组整体赋值——移动语义（释放旧值除非自我消费，规范 22.3）
             if t.is_darr() {
                 let de = match t {
@@ -858,6 +1078,7 @@ fn emit_stmt(
                 Ty::Struct(_) => unreachable!("Print 类型已归一化（结构体不可直接打印，检查器已拦截）"),
                 Ty::Arr(_) => unreachable!("Print 类型已归一化（数组不可直接打印，检查器已拦截）"),
                 Ty::DArr(_) | Ty::Tuple(_) => unreachable!("Print 类型已归一化（不可直接打印，检查器已拦截）"),
+                Ty::Map(_) => unreachable!("Print 类型已归一化（map 不可直接打印，检查器已拦截）"),
             };
             let cast = match t {
                 Ty::I32 | Ty::I64 => "(long long)",
@@ -870,6 +1091,7 @@ fn emit_stmt(
                 Ty::Arr(_) => unreachable!("Print 类型已归一化（数组不可直接打印，检查器已拦截）"),
                 Ty::DArr(_) => unreachable!("Print 类型已归一化（数组不可直接打印，检查器已拦截）"),
                 Ty::Tuple(_) => unreachable!("Print 类型已归一化（元组不可直接打印，检查器已拦截）"),
+                Ty::Map(_) => unreachable!("Print 类型已归一化（map 不可直接打印，检查器已拦截）"),
             };
             let val = if t == Ty::Bool {
                 format!("__t_tos_b((int)({}))", x)
@@ -996,6 +1218,7 @@ fn emit_stmt(
             Ty::Arr(_) => unreachable!("定长数组不可作为返回类型（检查器已拦截）"),
             Ty::DArr(_) => unreachable!("动态数组必走 owned 返回分支（检查器已拦截）"),
             Ty::Tuple(_) => unreachable!("元组必走 owned 返回分支（检查器已拦截）"),
+            Ty::Map(_) => unreachable!("map 必走 owned 返回分支（检查器已拦截）"),
                         };
                         let _ = writeln!(out, "return {}({});", cast, x);
                     }
@@ -1008,7 +1231,7 @@ fn emit_stmt(
                         Ty::Str => "__t_dup(\"\")",
                         Ty::Bool => "0",
                         Ty::Struct(_) => "NULL",
-                        Ty::DArr(_) => "NULL",
+                        Ty::DArr(_) | Ty::Map(_) => "NULL",
                         Ty::BorrowStr => unreachable!("借用不可作为返回类型（检查器已拦截）"),
             Ty::Arr(_) => unreachable!("数组不可作为返回类型（检查器已拦截）"),
             Ty::Tuple(_) => unreachable!("元组返回不可省略值（检查器已拦截）"),
@@ -1121,6 +1344,26 @@ fn emit_stmt(
                 emit_move_nulls(value, true, scope, sigs, out, level);
             }
         }
+        // v4.7：del(m, k) —— 删除键（不存在则静默；不改头部，无需重绑，规范第 25 节）
+        Stmt::Expr(Expr::Del { map, key }, _) => {
+            let bt = norm(ty_of(map, scope, sigs, &structs()).unwrap_or(Ty::I64));
+            let mde = crate::type_check::map_by_id(&crate::type_check::maps(), bt)
+                .expect("del 目标应为 map（检查器已拦截）")
+                .clone();
+            let be = match map.as_ref() {
+                Expr::Var(n) => cname(n),
+                _ => String::new(),
+            };
+            let mut ks = String::new();
+            emit_expr(key, scope, sigs, &mut ks);
+            let key_arg = if map_key_wire(mde.key) == "s" {
+                ks
+            } else {
+                format!("(long long)({})", ks)
+            };
+            indent(out, level);
+            let _ = writeln!(out, "__t_mdel_{}({}, {});", map_wire(&mde), be, key_arg);
+        }
         Stmt::Expr(e, _) => {
             let mut x = String::new();
             emit_expr(e, scope, sigs, &mut x);
@@ -1171,7 +1414,7 @@ fn emit_expr(e: &Expr, scope: &Scope, sigs: &HashMap<String, FuncSig>, out: &mut
         Expr::Str(s) => out.push_str(&c_str_lit(s)),
         Expr::Bool(b) => out.push_str(if *b { "1" } else { "0" }),
         Expr::Var(name) => out.push_str(&cname(name)),
-        // v3.3/v4.0：a[i] 读 —— 定长经 __t_idx，动态经 __t_dget_*（规范 16.3/22）
+        // v3.3/v4.0/v4.7：a[i] 读 —— 定长经 __t_idx，动态经 __t_dget_*，map 经 __t_mget_*（规范 16.3/22/25）
         Expr::Index(base, idx) => {
             let bt = norm(ty_of(base, scope, sigs, &structs()).unwrap_or(Ty::I64));
             let be = match base.as_ref() {
@@ -1180,7 +1423,19 @@ fn emit_expr(e: &Expr, scope: &Scope, sigs: &HashMap<String, FuncSig>, out: &mut
             };
             let mut is = String::new();
             emit_expr(idx, scope, sigs, &mut is);
-            if let Some(de) = crate::type_check::darr_by_id(&crate::type_check::darrs(), bt) {
+            if let Some(mde) = crate::type_check::map_by_id(&crate::type_check::maps(), bt) {
+                let key_arg = if map_key_wire(mde.key) == "s" {
+                    is
+                } else {
+                    format!("(long long)({})", is)
+                };
+                out.push_str(&format!(
+                    "__t_mget_{}({}, {})",
+                    map_wire(&mde.clone()),
+                    be,
+                    key_arg
+                ));
+            } else if let Some(de) = crate::type_check::darr_by_id(&crate::type_check::darrs(), bt) {
                 let helper = if de.elem == Ty::F64 {
                     "__t_dget_f"
                 } else if de.elem == Ty::Str {
@@ -1210,6 +1465,13 @@ fn emit_expr(e: &Expr, scope: &Scope, sigs: &HashMap<String, FuncSig>, out: &mut
                     _ => unreachable!("len 实参只能是变量（检查器已拦截）"),
                 };
                 out.push_str(&format!("__t_dlen({})", be));
+            } else if bt.is_map() {
+                // v4.7：len(m) —— 键值对数（规范第 25 节）
+                let be = match inner.as_ref() {
+                    Expr::Var(n) => cname(n),
+                    _ => unreachable!("len 实参只能是变量（检查器已拦截）"),
+                };
+                out.push_str(&format!("__t_mlen({})", be));
             } else {
                 let (_, len) = arr_of(bt);
                 out.push_str(&format!("(long long){}", len));
@@ -1218,6 +1480,32 @@ fn emit_expr(e: &Expr, scope: &Scope, sigs: &HashMap<String, FuncSig>, out: &mut
         // 数组字面量只出现在声明/赋值 RHS（已特判），不会走到通用表达式路径
         Expr::ArrLit { .. } => unreachable!("数组字面量位置非法（检查器已拦截）"),
         Expr::DArrLit { .. } => unreachable!("动态数组字面量位置非法（检查器已拦截）"),
+        // v4.7：map 字面量只在声明/赋值 RHS（见 emit_map_ctor），不走通用表达式路径
+        Expr::MapLit { .. } => unreachable!("map 字面量位置非法（检查器已拦截）"),
+        // v4.7：has(m, k) → bool —— __t_mhas_{keywire}（规范第 25 节）
+        Expr::Has { map, key } => {
+            let bt = norm(ty_of(map, scope, sigs, &structs()).unwrap_or(Ty::I64));
+            let mde = crate::type_check::map_by_id(&crate::type_check::maps(), bt)
+                .expect("has() 目标应为 map（检查器已拦截）")
+                .clone();
+            let be = match map.as_ref() {
+                Expr::Var(n) => cname(n),
+                _ => unreachable!("has 实参只能是变量（检查器已拦截）"),
+            };
+            let mut ks = String::new();
+            emit_expr(key, scope, sigs, &mut ks);
+            let key_arg = if map_key_wire(mde.key) == "s" {
+                ks
+            } else {
+                format!("(long long)({})", ks)
+            };
+            out.push_str(&format!(
+                "__t_mhas_{}({}, {})",
+                map_key_wire(mde.key),
+                be,
+                key_arg
+            ));
+        }
         // v4.5：元组表达式 → GNU 语句表达式：malloc 块 + 逐元素存储（规范第 24 节）
         Expr::TupExpr { elems, tup } => {
             let td = crate::type_check::tuples()[*tup as usize].clone();
@@ -1245,6 +1533,7 @@ fn emit_expr(e: &Expr, scope: &Scope, sigs: &HashMap<String, FuncSig>, out: &mut
         }
         Expr::Push { .. } => unreachable!("push 只能作为语句（检查器已拦截）"),
         Expr::Pop { .. } => unreachable!("pop 只能作为语句（检查器已拦截）"),
+        Expr::Del { .. } => unreachable!("del 只能作为语句（检查器已拦截）"),
         Expr::DArrLit { .. } => unreachable!("动态数组字面量位置非法（检查器已拦截）"),
         // v3.7：sel(条件, a, b) → C 三元表达式（惰性求值，与原生后端一致，规范第 18 节）
         Expr::Sel { cond, a, b } => {            out.push_str("((");
@@ -1394,6 +1683,12 @@ fn emit_expr(e: &Expr, scope: &Scope, sigs: &HashMap<String, FuncSig>, out: &mut
                     Ty::Str => emit_expr(arg, scope, sigs, out),
                     Ty::F64 => {
                         out.push_str("__t_tos_f(");
+                        emit_expr(arg, scope, sigs, out);
+                        out.push(')');
+                    }
+                    Ty::Bool => {
+                        // v4.7：tos(bool) → true/false（与原生后端/__t_tos_b 一致）
+                        out.push_str("__t_tos_b((int)");
                         emit_expr(arg, scope, sigs, out);
                         out.push(')');
                     }

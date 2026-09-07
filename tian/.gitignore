@@ -1,2 +1,8 @@
 tc/target/
 *.o
+
+# 编译产物不入库（黄金运行器每次重构都会重建用例可执行文件）
+tests/cases/*
+!tests/cases/*.*
+demo/*
+!demo/*.t

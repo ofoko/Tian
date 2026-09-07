@@ -125,12 +125,15 @@ pub fn check(prog: &Program) -> Result<(), CheckError> {
     set_arrs(&prog.arrs);
     set_darrs(&prog.darrs);
     set_tuples(&prog.tuples);
+    set_maps(&prog.maps);
     // 函数表（定义顺序无关）
     let mut funcs: HashMap<String, FuncSig> = HashMap::new();
     for f in &prog.funcs {
         let sig = FuncSig {
             params: f.params.iter().map(|p| p.ty.unwrap_or(Ty::I64)).collect(),
-            borrows: f.params.iter().map(|p| p.borrow && p.ty.map(|t| t.is_darr()).unwrap_or(false)).collect(),
+            borrows: f.params.iter()
+                .map(|p| p.borrow && p.ty.map(|t| t.is_darr() || t.is_map()).unwrap_or(false))
+                .collect(),
             ret: f.ret.unwrap_or(Ty::I64),
         };
         if funcs.insert(f.name.clone(), sig).is_some() {
@@ -173,6 +176,16 @@ pub fn check(prog: &Program) -> Result<(), CheckError> {
                 return Err(err(
                     f.line,
                     format!("结构体 '{}' 的字段 '{}' 不能是数组类型（v3.3 暂不支持）", sd.name, f.name),
+                ));
+            }
+            // v4.7：map 不能作为结构体字段（本轮不支持含容器的结构体，规范 25.5）
+            if f.ty.is_map() {
+                return Err(err(
+                    f.line,
+                    format!(
+                        "结构体 '{}' 的字段 '{}' 不能是 map 类型（v4.7 暂不支持嵌套容器）",
+                        sd.name, f.name
+                    ),
                 ));
             }
         }
@@ -499,63 +512,85 @@ fn check_stmt(
                         None => return Err(err(*line, format!("变量 '{}' 未声明", bn))),
                     };
                     let darr_param = info.is_param && info.ty.is_darr();
-                    if !info.mutable && !darr_param {
+                    // v4.7：map 形参同 darr 形参——元素写入即对局部句柄重绑（扩容换指针，见下 map 分支）
+                    let map_param = info.is_param && info.ty.is_map();
+                    if !info.mutable && !darr_param && !map_param {
                         return Err(err(
                             *line,
                             format!("变量 '{}' 是只读的（/ 声明），不能修改其元素", bn),
                         ));
                     }
                     let it = check_expr(idx, scope, funcs, structs, *line)?;
-                    if !matches!(it, Ty::I32 | Ty::I64) {
+                    // v4.7：m[k] = v —— 整体移动/重绑语义（扩容可能换指针）
+                    if let Some(m) = map_by_id(&maps(), info.ty) {
+                        if info.is_borrow {
+                            return Err(err(
+                                *line,
+                                format!("变量 '{}' 是借用 &map[..]（只读视图），不能写元素", bn),
+                            ));
+                        }
+                        if !info.mutable && !map_param {
+                            return Err(err(
+                                *line,
+                                format!("变量 '{}' 是只读的（/ 声明），map 元素写入需重绑变量，请用 // 声明", bn),
+                            ));
+                        }
+                        if !value_assignable(m.key, it, idx) {
+                            return Err(err(
+                                *line,
+                                format!("map 键期望 {}，实际 {}", m.key.label(), ty_label(it, structs)),
+                            ));
+                        }
+                        (Some(bn.clone()), m.val)
+                    } else if !matches!(it, Ty::I32 | Ty::I64) {
                         return Err(err(
                             *line,
                             format!("数组下标必须是整数，实际 {}", ty_label(it, structs)),
                         ));
-                    }
-                    // v4.2：str 不可按下标赋值（str 不可变，规范第 23 节）
-                    if norm(info.ty) == Ty::Str {
+                    } else if norm(info.ty) == Ty::Str {
+                        // v4.2：str 不可按下标赋值（str 不可变，规范第 23 节）
                         return Err(err(*line, "str 不可按下标赋值（str 不可变；用拼接构造新串）"));
-                    }
-                    if info.is_borrow {
+                    } else if info.is_borrow {
                         return Err(err(
                             *line,
                             format!("变量 '{}' 是借用 &[]T（只读视图），不能修改其元素", bn),
                         ));
-                    }
-                    // v4.0：动态数组下标赋值——长度运行时决定，仅静态检查（规范第 22 节）
-                    let dtable = darrs();
-                    if let Some(d) = darr_by_id(&dtable, info.ty) {
-                        if let Expr::Neg(x) = &**idx {
-                            if matches!(x.as_ref(), Expr::Int(_)) {
-                                return Err(err(*line, "数组下标不能为负"));
-                            }
-                        }
-                        (None, d.elem)
                     } else {
-                        let table = arrs();
-                        let a = arr_by_id(&table, info.ty).ok_or_else(|| {
-                            err(
-                                *line,
-                                format!("类型 {} 不能按下标赋值（左侧必须是数组）", ty_label(info.ty, structs)),
-                            )
-                        })?;
-                        if let Expr::Int(n) = &**idx {
-                            if *n < 0 || *n as u64 >= a.len {
-                                return Err(err(
-                                    *line,
-                                    format!("下标 {} 越界：数组长度为 {}（合法范围 0..{}）", n, a.len, a.len - 1),
-                                ));
+                        // v4.0：动态数组下标赋值——长度运行时决定，仅静态检查（规范第 22 节）
+                        let dtable = darrs();
+                        if let Some(d) = darr_by_id(&dtable, info.ty) {
+                            if let Expr::Neg(x) = &**idx {
+                                if matches!(x.as_ref(), Expr::Int(_)) {
+                                    return Err(err(*line, "数组下标不能为负"));
+                                }
                             }
-                        }
-                        if let Expr::Neg(x) = &**idx {
-                            if let Expr::Int(n) = x.as_ref() {
-                                return Err(err(
+                            (None, d.elem)
+                        } else {
+                            let table = arrs();
+                            let a = arr_by_id(&table, info.ty).ok_or_else(|| {
+                                err(
                                     *line,
-                                    format!("下标 -{} 越界：数组下标不能为负（合法范围 0..{}）", n, a.len - 1),
-                                ));
+                                    format!("类型 {} 不能按下标赋值（左侧必须是数组或 map）", ty_label(info.ty, structs)),
+                                )
+                            })?;
+                            if let Expr::Int(n) = &**idx {
+                                if *n < 0 || *n as u64 >= a.len {
+                                    return Err(err(
+                                        *line,
+                                        format!("下标 {} 越界：数组长度为 {}（合法范围 0..{}）", n, a.len, a.len - 1),
+                                    ));
+                                }
                             }
+                            if let Expr::Neg(x) = &**idx {
+                                if let Expr::Int(n) = x.as_ref() {
+                                    return Err(err(
+                                        *line,
+                                        format!("下标 -{} 越界：数组下标不能为负（合法范围 0..{}）", n, a.len - 1),
+                                    ));
+                                }
+                            }
+                            (None, a.elem)
                         }
-                        (None, a.elem)
                     }
                 }
                 _ => return Err(err(*line, "赋值的左侧只能是变量、变量.字段 或 数组元素 a[i]")),
@@ -633,6 +668,16 @@ fn check_stmt(
                     ),
                 ));
             }
+            // v4.7：map 整体不可直接打印（规范 25.5）
+            if t.is_map() {
+                return Err(err(
+                    *line,
+                    format!(
+                        "不能直接打印 map '{}'（请打印具体键值，如 `has(m, \"x\")、`len(m) 或逐一 `m[k]）",
+                        ty_label(t, structs)
+                    ),
+                ));
+            }
             Ok(())
         }
         Stmt::While { cond, body, line } => {
@@ -681,22 +726,24 @@ fn check_stmt(
                         "借用不能逃逸函数（&str 形参不可返回；需要所有权请用 copy() 产生新所有者）",
                     ));
                 }
-                // v4.3：借用动态数组形参不可作为返回值（借用不逃逸，规范 22.8）
-                if fn_ret.is_darr() {
+                // v4.3：借用动态数组形参不可作为返回值（借用不逃逸，规范 22.8）；
+                // v4.7：借用 map 形参同理（规范 25.6）
+                if fn_ret.is_darr() || fn_ret.is_map() {
                     if let Expr::Var(n) = expr {
                         if scope.get(n).map(|v| v.is_borrow).unwrap_or(false) {
                             return Err(err(
                                 *line,
-                                "借用 &[]T 不可逃逸函数（&[]T 形参不可返回；需要所有权请让调用方持有）",
+                                "借用 &[]T/&map 不可逃逸函数（借用形参不可返回；需要所有权请让调用方持有）",
                             ));
                         }
                     }
                 }
-                // v4.0：动态数组返回值只能是变量或函数调用（字面量无法在表达式位构造，规范 22.4）
-                if fn_ret.is_darr() && !matches!(expr, Expr::Var(_) | Expr::Call { .. }) {
+                // v4.0：动态数组返回值只能是变量或函数调用（字面量无法在表达式位构造，规范 22.4）；
+                // v4.7：map 同理（map[K]V 字面量必须先赋给变量）
+                if (fn_ret.is_darr() || fn_ret.is_map()) && !matches!(expr, Expr::Var(_) | Expr::Call { .. }) {
                     return Err(err(
                         *line,
-                        "动态数组返回值只能是数组变量或函数调用（字面量请先赋给变量）",
+                        "动态数组/map 返回值只能是变量或函数调用（字面量请先赋给变量）",
                     ));
                 }
                 // v0.3：返回类型须与标注一致（提升规则见 value_assignable，规范 5.3）
@@ -829,7 +876,36 @@ fn check_stmt(
                 }
                 Ok(())
             }
-            _ => Err(err(*line, "语句级表达式只能是函数调用或 push")),
+            // v4.7：del(m, k) 语句 —— m 必须是可变的（非借用）map 变量；键类型匹配
+            Expr::Del { map, key } => {
+                let bn = match map.as_ref() {
+                    Expr::Var(bn) => bn,
+                    _ => return Err(err(*line, "del 的第一个实参必须是 map 变量")),
+                };
+                let info = match scope.get(bn) {
+                    Some(v) => *v,
+                    None => return Err(err(*line, format!("变量 '{}' 未声明", bn))),
+                };
+                if info.is_borrow {
+                    return Err(err(
+                        *line,
+                        format!("变量 '{}' 是借用 &map[..]（只读视图），不能 del", bn),
+                    ));
+                }
+                let table = maps();
+                let m = map_by_id(&table, info.ty).ok_or_else(|| {
+                    err(*line, format!("类型 {} 不能 del（只有 map 可以）", ty_label(info.ty, structs)))
+                })?;
+                let kt = check_expr(key, scope, funcs, structs, *line)?;
+                if !value_assignable(m.key, kt, key) {
+                    return Err(err(
+                        *line,
+                        format!("del 键期望 {}，实际 {}", m.key.label(), ty_label(kt, structs)),
+                    ));
+                }
+                Ok(())
+            }
+            _ => Err(err(*line, "语句级表达式只能是函数调用、push、pop 或 del")),
         },
     }
 }
@@ -907,7 +983,7 @@ pub fn norm(t: Ty) -> Ty {
 /// v3.0：受天权所有权约束的堆类型——str 与结构体（规范 11.2 / 14.4）。
 /// 赋值、传参、返回均移动所有权；数值与 bool 为纯值类型，不参与。
 pub fn is_owned(t: Ty) -> bool {
-    t == Ty::Str || t.is_struct() || t.is_darr()
+    t == Ty::Str || t.is_struct() || t.is_darr() || t.is_map()
 }
 
 // ── v3.0 结构体表（代码生成侧共享）──────────────────────────────
@@ -964,6 +1040,10 @@ pub fn ty_label(t: Ty, structs: &[StructDef]) -> String {
             .get(i as usize)
             .map(|d| format!("[]{}", d.elem.label()))
             .unwrap_or_else(|| "darr".into()),
+        Ty::Map(i) => maps()
+            .get(i as usize)
+            .map(|m| format!("map[{}]{}", m.key.label(), m.val.label()))
+            .unwrap_or_else(|| "map".into()),
         other => other.label().to_string(),
     }
 }
@@ -1037,6 +1117,29 @@ pub fn tuple_by_id<'a>(tuples: &'a [TupleDef], t: Ty) -> Option<&'a TupleDef> {
     }
 }
 
+// ── v4.7 关联数组类型表（机制同 ARRS/DARRS；规范第 25 节）────────────
+thread_local! {
+    static MAPS: std::cell::RefCell<Vec<MapDef>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// 设置当前线程的关联数组类型表（检查入口与后端入口均调用）
+pub fn set_maps(maps: &[MapDef]) {
+    MAPS.with(|m| *m.borrow_mut() = maps.to_vec());
+}
+
+/// 读取当前线程的关联数组类型表快照
+pub fn maps() -> Vec<MapDef> {
+    MAPS.with(|m| m.borrow().clone())
+}
+
+/// v4.7：按 Ty::Map 索引取关联数组定义
+pub fn map_by_id<'a>(maps: &'a [MapDef], t: Ty) -> Option<&'a MapDef> {
+    match t {
+        Ty::Map(i) => maps.get(i as usize),
+        _ => None,
+    }
+}
+
 /// 变量类型查询抽象：让 ty_of 同时服务于检查器（VarInfo 表）
 /// 与天权代码生成的 str 声明收集（纯 Ty 表）
 pub trait TyLookup {
@@ -1100,6 +1203,10 @@ pub fn ty_of<S: TyLookup>(
         // v3.3：a[i] 类型 = 元素类型（下标校验在 check_expr）
         Expr::Index(base, idx) => {
             let bt = norm(ty_of(base, scope, funcs, structs)?);
+            // v4.7：m[k] 类型 = 值类型 V（键类型校验在 check_expr；map 键可为 str 或 i64，规范第 25 节）
+            if let Some(m) = map_by_id(&maps(), bt) {
+                return Ok(m.val);
+            }
             let it = norm(ty_of(idx, scope, funcs, structs)?);
             if !matches!(it, Ty::I32 | Ty::I64) {
                 return Err(err(0, format!("数组下标必须是整数，实际 {}", ty_label(it, structs))));
@@ -1113,12 +1220,11 @@ pub fn ty_of<S: TyLookup>(
                 return Ok(a.elem);
             }
             let dtable = darrs();
-            let d = darr_by_id(&dtable, bt).ok_or_else(|| {
-                err(0, format!("类型 {} 不能取下标（只有数组和 str 能用 [i]）", ty_label(bt, structs)))
-            })?;
-            Ok(d.elem)
+            if let Some(d) = darr_by_id(&dtable, bt) {
+                return Ok(d.elem);
+            }
+            Err(err(0, format!("类型 {} 不能取下标（只有数组、str 和 map 能用 [i]）", ty_label(bt, structs))))
         }
-        // v4.2：sub 产生新所有权的堆串（规范第 23 节）
         Expr::Sub { .. } => Ok(Ty::Str),
         // v4.0：动态数组字面量类型
         Expr::DArrLit { darr, .. } => {
@@ -1127,18 +1233,29 @@ pub fn ty_of<S: TyLookup>(
             }
             Ok(Ty::DArr(*darr))
         }
+        // v4.7：map 字面量类型（条目标键/值类型校验在 check_expr）
+        Expr::MapLit { map, .. } => {
+            if maps().get(*map as usize).is_none() {
+                return Err(err(0, "内部错误：关联数组类型索引越界"));
+            }
+            Ok(Ty::Map(*map))
+        }
+        // v4.7：has(m, k) → bool
+        Expr::Has { .. } => Ok(Ty::Bool),
+        // v4.7：del(m, k) 无值（仅语句级，规范第 25 节）
+        Expr::Del { .. } => Err(err(0, "del 不产生值（只能作为语句）")),
         // v4.0/v4.1：push/pop 无值（仅语句级，规范第 22 节）
         // v4.2：sub 产生新所有权的堆串
         Expr::Sub { .. } => Ok(Ty::Str),
         Expr::Push { .. } => Err(err(0, "push 不产生值（只能作为语句）")),
         Expr::Pop { .. } => Err(err(0, "pop 不产生值（只能作为语句）")),
-        // v3.3：len(a) 为编译期常量 i64；len(s) 为 UTF-8 字节数
+        // v3.3：len(a) 为编译期常量 i64；len(s) 为 UTF-8 字节数；v4.7：len(m) 返回键值对数
         Expr::Len(inner) => {
             let t = norm(ty_of(inner, scope, funcs, structs)?);
-            if t.is_arr() || t == Ty::Str || t.is_darr() {
+            if t.is_arr() || t == Ty::Str || t.is_darr() || t.is_map() {
                 return Ok(Ty::I64);
             }
-            Err(err(0, format!("len() 只能用于数组或 str，实际 {}", ty_label(t, structs))))
+            Err(err(0, format!("len() 只能用于数组、str 或 map，实际 {}", ty_label(t, structs))))
         }
         // v3.7：sel(cond, a, b) —— 仅数值/bool 分支；类型按提升规则统一（规范第 18 节）
         Expr::Sel { cond, a, b } => {
@@ -1203,15 +1320,15 @@ pub fn ty_of<S: TyLookup>(
                 }
             }
         }
-        // v4.3：宽松推导（借用合法性由 check_expr 严格校验，规范 11.6 / 22.8）
+        // v4.3：宽松推导（借用合法性由 check_expr 严格校验，规范 11.6 / 22.8 / 25.6）
         Expr::Borrow(inner) => {
             let t = ty_of(inner, scope, funcs, structs)?;
             if t == Ty::Str {
                 Ok(Ty::BorrowStr)
-            } else if t.is_darr() {
+            } else if t.is_darr() || t.is_map() {
                 Ok(t)
             } else {
-                Err(err(0, format!("只能借用 str 或动态数组，实际 {}", t.label())))
+                Err(err(0, format!("只能借用 str、动态数组或 map，实际 {}", t.label())))
             }
         }
         Expr::Call { name, args } => {
@@ -1414,12 +1531,12 @@ fn check_expr(
             }
         }
         Expr::Borrow(inner) => {
-            // v4.3：宽松推导（借用合法性由 check_expr 严格校验，规范 11.6 / 22.8）
+            // v4.3：宽松推导（借用合法性由 check_expr 严格校验，规范 11.6 / 22.8 / 25.6）
             let t = ty_of(inner, scope, funcs, structs)?;
-            if t == Ty::Str || t.is_darr() {
+            if t == Ty::Str || t.is_darr() || t.is_map() {
                 Ok(if t == Ty::Str { Ty::BorrowStr } else { t })
             } else {
-                Err(err(0, format!("只能借用 str 或动态数组，实际 {}", t.label())))
+                Err(err(0, format!("只能借用 str、动态数组或 map，实际 {}", t.label())))
             }
         }
         Expr::Call { name, args } => {
@@ -1547,10 +1664,10 @@ fn check_expr(
                                 if v.is_borrow {
                                     continue; // 借用转借（视图无所有权）
                                 }
-                                if darr_by_id(&darrs(), v.ty).is_none() {
+                                if darr_by_id(&darrs(), v.ty).is_none() && map_by_id(&maps(), v.ty).is_none() {
                                     return Err(err(
                                         line,
-                                        format!("函数 '{}' 的 &[]T 形参期望动态数组变量", name),
+                                        format!("函数 '{}' 的 &[]T/&map 形参期望动态数组或 map 变量", name),
                                     ));
                                 }
                                 continue;
@@ -1732,6 +1849,16 @@ fn check_expr(
             let bt = check(base, scope)?;
             let nt = norm(bt);
             let it = check(idx, scope)?;
+            // v4.7：m[k] —— 键类型须与 map 键类型一致（K ∈ {i64,str}）
+            if let Some(m) = map_by_id(&maps(), nt) {
+                if !value_assignable(m.key, it, idx) {
+                    return Err(err(
+                        line,
+                        format!("map 键期望 {}，实际 {}", m.key.label(), ty_label(it, structs)),
+                    ));
+                }
+                return Ok(m.val);
+            }
             if !matches!(it, Ty::I32 | Ty::I64) {
                 return Err(err(
                     line,
@@ -1795,14 +1922,56 @@ fn check_expr(
             }
             Ok(Ty::DArr(*darr))
         }
+        // v4.7：map 字面量——条目标键/值类型校验（规范第 25 节）
+        Expr::MapLit { map, entries } => {
+            let table = maps();
+            let m = table
+                .get(*map as usize)
+                .ok_or_else(|| err(line, "内部错误：关联数组类型索引越界"))?;
+            for (i, (k, v)) in entries.iter().enumerate() {
+                let kt = norm(check(k, scope)?);
+                if !value_assignable(m.key, kt, k) {
+                    return Err(err(
+                        line,
+                        format!("map 条目 #{} 键期望 {}，实际 {}", i, m.key.label(), ty_label(kt, structs)),
+                    ));
+                }
+                let vt = norm(check(v, scope)?);
+                if !value_assignable(m.val, vt, v) {
+                    return Err(err(
+                        line,
+                        format!("map 条目 #{} 值期望 {}，实际 {}", i, m.val.label(), ty_label(vt, structs)),
+                    ));
+                }
+            }
+            Ok(Ty::Map(*map))
+        }
+        // v4.7：has(m, k) → bool（表达式）
+        Expr::Has { map, key } => {
+            let mt = norm(check(map, scope)?);
+            let ms = maps();
+            let m = map_by_id(&ms, mt).ok_or_else(|| {
+                err(line, format!("has() 第一个实参必须是 map，实际 {}", ty_label(mt, structs)))
+            })?;
+            let kt = norm(check(key, scope)?);
+            if !value_assignable(m.key, kt, key) {
+                return Err(err(
+                    line,
+                    format!("has() 键期望 {}，实际 {}", m.key.label(), ty_label(kt, structs)),
+                ));
+            }
+            Ok(Ty::Bool)
+        }
+        // v4.7：del(m, k) 是语句级（作表达式取值报错，规范第 25 节）
+        Expr::Del { .. } => Err(err(line, "del 只能作为语句使用")),
         // v3.5/v4.0：len —— 定长数组 / str / 动态数组
         Expr::Len(inner) => {
             let t = check(inner, scope)?;
             let nt = norm(t);
-            if !nt.is_arr() && nt != Ty::Str && !nt.is_darr() {
+            if !nt.is_arr() && nt != Ty::Str && !nt.is_darr() && !nt.is_map() {
                 return Err(err(
                     line,
-                    format!("len() 只能用于数组或 str，实际 {}", ty_label(nt, structs)),
+                    format!("len() 只能用于数组、str 或 map，实际 {}", ty_label(nt, structs)),
                 ));
             }
             Ok(Ty::I64)

@@ -29,6 +29,7 @@ pub fn parse(toks: Vec<(Tok, usize)>) -> Result<Program, ParseError> {
         files: vec!["<内存源码>".to_string()],
         visited: std::collections::HashSet::new(),
         saved: Vec::new(),
+        maps: Vec::new(),
     }
     .parse_program()
 }
@@ -56,6 +57,7 @@ pub fn parse_file(path: &str) -> Result<Program, ParseError> {
         files: vec![path.to_string()],
         visited: std::collections::HashSet::from([canon]),
         saved: Vec::new(),
+        maps: Vec::new(),
     };
     p.parse_program()
 }
@@ -83,6 +85,8 @@ struct Parser {
     tuples: Vec<TupleDef>,
     // v4.5：当前函数返回类型栈（元组多值返回解析用）
     ret_stack: Vec<Ty>,
+    // v4.7：关联数组类型表（按 (key,val) 去重）
+    maps: Vec<MapDef>,
 }
 
 impl Parser {
@@ -186,6 +190,7 @@ impl Parser {
         prog.arrs = std::mem::take(&mut self.arrs);
         prog.darrs = std::mem::take(&mut self.darrs);
         prog.tuples = std::mem::take(&mut self.tuples);
+        prog.maps = std::mem::take(&mut self.maps);
         prog.uses = std::mem::take(&mut self.uses);
         Ok(prog)
     }
@@ -485,7 +490,7 @@ impl Parser {
                 Ok(Stmt::Continue(start_line))
             }
             // v4.0：panic(msg) / check(cond, msg) 快速失败语句（规范第 21 节）
-            Tok::ConvertFn(ref n) if n == "panic" || n == "check" || n == "push" || n == "pop" => {
+            Tok::ConvertFn(ref n) if n == "panic" || n == "check" || n == "push" || n == "pop" || n == "del" => {
                 self.bump();
                 self.expect(&Tok::LParen)?;
                 let first = self.parse_expr()?;
@@ -499,6 +504,19 @@ impl Parser {
                     self.expect_newline()?;
                     Ok(Stmt::Expr(
                         Expr::Pop { arr: Box::new(first) },
+                        start_line,
+                    ))
+                } else if n == "del" {
+                    // v4.7：del(m, key) 删除键（规范第 25 节）
+                    self.expect(&Tok::Comma)?;
+                    let second = self.parse_expr()?;
+                    self.expect(&Tok::RParen)?;
+                    self.expect_newline()?;
+                    Ok(Stmt::Expr(
+                        Expr::Del {
+                            map: Box::new(first),
+                            key: Box::new(second),
+                        },
                         start_line,
                     ))
                 } else {
@@ -691,6 +709,12 @@ impl Parser {
             }
             return Ok(self.tuple_id(elems));
         }
+        // v4.7：map[K]V 关联数组类型（规范第 25 节）
+        if let Tok::Ident(name) = self.peek() {
+            if name == "map" {
+                return self.parse_map_type();
+            }
+        }
         // v4.0：[]T 动态数组类型（规范第 22 节）
         if *self.peek() == Tok::LBracket {
             self.bump(); // [
@@ -736,6 +760,13 @@ impl Parser {
                 self.last_type_borrow = true;
                 return Ok(self.darr_id(elem));
             }
+            // v4.7：&map[K]V —— 只读借用关联数组（规范 25.6）
+            if let Tok::Ident(n) = self.peek() {
+                if n == "map" {
+                    self.last_type_borrow = true;
+                    return self.parse_map_type();
+                }
+            }
             let name = self.expect_ident()?;
             return match name.as_str() {
                 "str" => Ok(Ty::BorrowStr),
@@ -775,6 +806,48 @@ impl Parser {
         }
         self.darrs.push(DArrDef { elem });
         Ty::DArr((self.darrs.len() - 1) as u32)
+    }
+
+    /// v4.7：按 (key,val) 取关联数组类型 id（去重，规范第 25 节）
+    fn map_id(&mut self, key: Ty, val: Ty) -> Ty {
+        if let Some(i) = self.maps.iter().position(|m| m.key == key && m.val == val) {
+            return Ty::Map(i as u32);
+        }
+        self.maps.push(MapDef { key, val });
+        Ty::Map((self.maps.len() - 1) as u32)
+    }
+
+    /// v4.7：map[K]V 关联数组类型（K ∈ {i64,str}；V ∈ {i32,i64,f64,bool,str}）
+    fn parse_map_type(&mut self) -> Result<Ty, ParseError> {
+        self.expect_ident()?; // map
+        self.expect(&Tok::LBracket)?;
+        let key_name = self.expect_ident()?;
+        let key = match key_name.as_str() {
+            "i64" => Ty::I64,
+            "str" => Ty::Str,
+            other => {
+                return Err(self.err(format!(
+                    "map 键类型须为 i64 或 str（实际 '{}'）",
+                    other
+                )))
+            }
+        };
+        self.expect(&Tok::RBracket)?;
+        let val_name = self.expect_ident()?;
+        let val = match val_name.as_str() {
+            "i32" => Ty::I32,
+            "i64" => Ty::I64,
+            "f64" => Ty::F64,
+            "bool" => Ty::Bool,
+            "str" => Ty::Str,
+            other => {
+                return Err(self.err(format!(
+                    "map 值类型须为 i32/i64/f64/bool/str（实际 '{}'）",
+                    other
+                )))
+            }
+        };
+        Ok(self.map_id(key, val))
     }
 
     /// v3.3：类型后缀 [N] → 固定长度数组（仅值类型元素；str/结构体数组不支持）
@@ -945,6 +1018,33 @@ impl Parser {
             }
             Tok::Ident(name) => {
                 let line = self.line();
+                // v4.7：map[K]V{ k1: v1, ... } 关联数组字面量（规范第 25 节）。
+                // 此处尚未 bump map 关键字，parse_map_type 会消费之。
+                if name == "map" && self.peek2() == Some(&Tok::LBracket) {
+                    let ty = self.parse_map_type()?;
+                    let map = match ty {
+                        Ty::Map(i) => i,
+                        _ => unreachable!(),
+                    };
+                    let mut entries = Vec::new();
+                    self.expect(&Tok::LBrace)?;
+                    self.skip_newlines();
+                    while *self.peek() != Tok::RBrace {
+                        if *self.peek() == Tok::Eof {
+                            return Err(self.err("map 字面量未闭合（缺少 }）"));
+                        }
+                        let k = self.parse_expr()?;
+                        self.expect(&Tok::Colon)?;
+                        let v = self.parse_expr()?;
+                        entries.push((k, v));
+                        if *self.peek() == Tok::Comma {
+                            self.bump();
+                        }
+                        self.skip_newlines();
+                    }
+                    self.bump(); // }
+                    return Ok(Expr::MapLit { map, entries });
+                }
                 self.bump();
                 // v3.0：Point{...} 结构体字面量（调用与字段访问交给 parse_postfix）
                 // 仅当标识符是已声明的结构体名时才解析为结构体字面量；
@@ -988,6 +1088,18 @@ impl Parser {
                     return Ok(Expr::Push {
                         arr: Box::new(arr),
                         value: Box::new(value),
+                    });
+                }
+                // v4.7：has(m, k) 键存在性（表达式，规范第 25 节）
+                if name == "has" {
+                    self.expect(&Tok::LParen)?;
+                    let map = self.parse_expr()?;
+                    self.expect(&Tok::Comma)?;
+                    let key = self.parse_expr()?;
+                    self.expect(&Tok::RParen)?;
+                    return Ok(Expr::Has {
+                        map: Box::new(map),
+                        key: Box::new(key),
                     });
                 }
                 // v4.2：sub(s, start, n) 子串（规范第 23 节）

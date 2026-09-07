@@ -1,0 +1,12 @@
+m1 len=2
+m1 a=11
+m1 b=2
+has c=false
+after del b: false, len=2
+m2 len=20
+m2[19]=361
+m3[2]=two
+m3 has 1=true
+m4 name=Tian
+m4 len=1
+m5 pi=3.25

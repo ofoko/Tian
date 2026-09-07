@@ -493,6 +493,8 @@ impl Lexer {
             || word == "pop"
             || word == "sub"
             || word == "tof"
+            || word == "has"
+            || word == "del"
         {
             return Ok(Tok::ConvertFn(word));
         }

@@ -189,6 +189,41 @@ fn fmt_expr(e: &Expr, out: &mut String) {
             fmt_expr(n, out);
             out.push(')');
         }
+        // v4.7：map 字面量 map[K]V{ k1: v1, ... }（可空 {}；规范第 25 节）
+        Expr::MapLit { map, entries } => {
+            let minfo = crate::type_check::maps();
+            if let Some(m) = minfo.get(*map as usize) {
+                out.push_str(&format!("map[{}]{}", m.key.label(), m.val.label()));
+            } else {
+                out.push_str("map");
+            }
+            out.push('{');
+            for (i, (k, v)) in entries.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                fmt_expr(k, out);
+                out.push_str(": ");
+                fmt_expr(v, out);
+            }
+            out.push('}');
+        }
+        // v4.7：has(m, k) → bool（表达式）
+        Expr::Has { map, key } => {
+            out.push_str("has(");
+            fmt_expr(map, out);
+            out.push_str(", ");
+            fmt_expr(key, out);
+            out.push(')');
+        }
+        // v4.7：del(m, k)（语句级）
+        Expr::Del { map, key } => {
+            out.push_str("del(");
+            fmt_expr(map, out);
+            out.push_str(", ");
+            fmt_expr(key, out);
+            out.push(')');
+        }
     }
 }
 
@@ -350,6 +385,14 @@ fn ty_str(t: Ty) -> String {
                 None => "tuple".into(),
             }
         }
+        // v4.7：map 类型还原为 map[K]V（规范第 25 节）
+        Ty::Map(i) => {
+            let mt = crate::type_check::maps();
+            match mt.get(i as usize) {
+                Some(m) => format!("map[{}]{}", m.key.label(), m.val.label()),
+                None => "map".into(),
+            }
+        }
         other => other.label().to_string(),
     }
 }
@@ -360,6 +403,7 @@ pub fn format(prog: &Program) -> String {
     crate::type_check::set_arrs(&prog.arrs);
     crate::type_check::set_darrs(&prog.darrs);
     crate::type_check::set_structs(&prog.structs);
+    crate::type_check::set_maps(&prog.maps);
     let mut out = String::new();
     for u in &prog.uses {
         out.push_str(&format!("use {}\n", u));

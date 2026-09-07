@@ -160,3 +160,236 @@ void* __t_dpush_f(void* h, double v) {
     ((__t_darr_hdr*)h)->len++;
     return h;
 }
+
+// ── v4.7 关联数组 map[K]V（规范第 25 节）────────────────────────
+// 布局：头部复用 darr 的 {len,cap}（各 8 字节），随后桶数组 cap*8 字节。
+// 桶数恒为 2 的幂；节点独立 malloc（不入块），扩容 realloc 只搬块与桶数组、节点不动。
+// 节点 key/val 为 8 字节槽：str 存指针、f64 以位模式存、i64/bool 直存。
+// 所有 K×V 变体节点布局统一；链哈希沿 hash & (cap-1)。
+// 键自白名单：i64、str；值 wire 三类：i(long long)/f(double)/s(char*)。
+typedef struct __t_mnode { long long hash; struct __t_mnode* next; long long key; long long val; } __t_mnode;
+typedef struct { long long len, cap; } __t_map_hdr;
+static __t_mnode** __t_mbuckets(void* h) { return (__t_mnode**)((char*)h + 16); }
+
+// str 键 FNV-1a 64；i64 键 splitmix64 扰动
+static long long __t_mhash_s(const char* s) {
+    long long h = 0xcbf29ce484222325;
+    while (*s) h = (h ^ (unsigned char)*s++) * 0x100000001b3;
+    return h;
+}
+static long long __t_mhash_i(long long x) {
+    x ^= x >> 33; x *= 0xff51afd7ed558ccd;
+    x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53;
+    x ^= x >> 33;
+    return x;
+}
+
+static __t_mnode* __t_mfind_i(void* h, long long k) {
+    __t_map_hdr* x = (__t_map_hdr*)h;
+    __t_mnode* n = __t_mbuckets(h)[__t_mhash_i(k) & (x->cap - 1)];
+    while (n && n->key != k) n = n->next;
+    return n;
+}
+static __t_mnode* __t_mfind_s(void* h, const char* k) {
+    __t_map_hdr* x = (__t_map_hdr*)h;
+    __t_mnode* n = __t_mbuckets(h)[__t_mhash_s(k) & (x->cap - 1)];
+    while (n && strcmp((char*)n->key, k)) n = n->next;
+    return n;
+}
+
+// 扩容：cap *= 2，重链全部节点（cap 恒为 2 幂 → 每个节点只落回本桶或新一半，不交叉）
+static void* __t_mgrow(void* h) {
+    __t_map_hdr* x = (__t_map_hdr*)h;
+    long long oldcap = x->cap;
+    long long newcap = oldcap * 2;
+    void* n = realloc(h, 16 + (size_t)newcap * 8);
+    if (!n) { fprintf(stderr, "天运行时：内存分配失败\n"); exit(1); }
+    ((__t_map_hdr*)n)->cap = newcap;
+    __t_mnode** b = __t_mbuckets(n);
+    memset(b + oldcap, 0, (size_t)oldcap * 8);   // 新一半清零
+    for (long long i = 0; i < oldcap; i++) {
+        __t_mnode* cur = b[i];
+        b[i] = NULL;                              // 摘下本桶，避免重复重链
+        while (cur) {
+            __t_mnode* nx = cur->next;
+            long long j = cur->hash & (newcap - 1);
+            cur->next = b[j];
+            b[j] = cur;
+            cur = nx;
+        }
+    }
+    return n;
+}
+
+static __t_mnode* __t_mnode_new(void) {
+    __t_mnode* n = (__t_mnode*)malloc(sizeof(__t_mnode));
+    if (!n) { fprintf(stderr, "天运行时：内存分配失败\n"); exit(1); }
+    return n;
+}
+
+void* __t_mnew(long long cap) {
+    if (cap < 8) cap = 8;
+    void* h = malloc(16 + (size_t)cap * 8);
+    if (!h) { fprintf(stderr, "天运行时：内存分配失败\n"); exit(1); }
+    ((__t_map_hdr*)h)->len = 0;
+    ((__t_map_hdr*)h)->cap = cap;
+    memset(__t_mbuckets(h), 0, (size_t)cap * 8);
+    return h;
+}
+long long __t_mlen(void* h) { return ((__t_map_hdr*)h)->len; }
+
+// has：命中 bool，未命中不 panic
+long long __t_mhas_i(void* h, long long k) { return __t_mfind_i(h, k) != NULL; }
+long long __t_mhas_s(void* h, const char* k) { return __t_mfind_s(h, k) != NULL; }
+
+// get：命中返回值；未命中快速失败（对拍数组越界）
+long long __t_mget_ii(void* h, long long k) { __t_mnode* n = __t_mfind_i(h, k); if (!n) __t_panic("map 键不存在"); return n->val; }
+double __t_mget_if(void* h, long long k) { __t_mnode* n = __t_mfind_i(h, k); if (!n) __t_panic("map 键不存在"); double d; memcpy(&d, &n->val, 8); return d; }
+char* __t_mget_is(void* h, long long k) { __t_mnode* n = __t_mfind_i(h, k); if (!n) __t_panic("map 键不存在"); return (char*)n->val; }
+long long __t_mget_si(void* h, const char* k) { __t_mnode* n = __t_mfind_s(h, k); if (!n) __t_panic("map 键不存在"); return n->val; }
+double __t_mget_sf(void* h, const char* k) { __t_mnode* n = __t_mfind_s(h, k); if (!n) __t_panic("map 键不存在"); double d; memcpy(&d, &n->val, 8); return d; }
+char* __t_mget_ss(void* h, const char* k) { __t_mnode* n = __t_mfind_s(h, k); if (!n) __t_panic("map 键不存在"); return (char*)n->val; }
+
+// set：整体移动语义 → 返回新 h，调用方必须重绑（可能 realloc）。
+// str 键：调用方交付一份新副本，键已存在则消费（free）该副本、复用旧节点；不存在则接管新开节点。
+
+void* __t_mset_ii(void* h, long long k, long long v) {
+    __t_map_hdr* x = (__t_map_hdr*)h;
+    __t_mnode* n = __t_mfind_i(h, k);
+    if (n) { n->val = v; return h; }
+    if ((x->len + 1) * 4 > x->cap * 3) { h = __t_mgrow(h); x = (__t_map_hdr*)h; }
+    long long hh = __t_mhash_i(k);
+    __t_mnode* nn = __t_mnode_new();
+    nn->hash = hh; nn->key = k; nn->val = v;
+    nn->next = __t_mbuckets(h)[hh & (x->cap - 1)];
+    __t_mbuckets(h)[hh & (x->cap - 1)] = nn;
+    x->len++;
+    return h;
+}
+void* __t_mset_if(void* h, long long k, double v) {
+    long long bits; memcpy(&bits, &v, 8);
+    return __t_mset_ii(h, k, bits);
+}
+void* __t_mset_is(void* h, long long k, char* v) {
+    __t_map_hdr* x = (__t_map_hdr*)h;
+    __t_mnode* n = __t_mfind_i(h, k);
+    if (n) { free((void*)n->val); n->val = (long long)v; return h; }
+    if ((x->len + 1) * 4 > x->cap * 3) { h = __t_mgrow(h); x = (__t_map_hdr*)h; }
+    long long hh = __t_mhash_i(k);
+    __t_mnode* nn = __t_mnode_new();
+    nn->hash = hh; nn->key = k; nn->val = (long long)v;
+    nn->next = __t_mbuckets(h)[hh & (x->cap - 1)];
+    __t_mbuckets(h)[hh & (x->cap - 1)] = nn;
+    x->len++;
+    return h;
+}
+void* __t_mset_si(void* h, char* k, long long v) {
+    __t_map_hdr* x = (__t_map_hdr*)h;
+    __t_mnode* n = __t_mfind_s(h, k);
+    if (n) { free(k); n->val = v; return h; }
+    if ((x->len + 1) * 4 > x->cap * 3) { h = __t_mgrow(h); x = (__t_map_hdr*)h; }
+    long long hh = __t_mhash_s(k);
+    __t_mnode* nn = __t_mnode_new();
+    nn->hash = hh; nn->key = (long long)k; nn->val = v;
+    nn->next = __t_mbuckets(h)[hh & (x->cap - 1)];
+    __t_mbuckets(h)[hh & (x->cap - 1)] = nn;
+    x->len++;
+    return h;
+}
+void* __t_mset_sf(void* h, char* k, double v) {
+    long long bits; memcpy(&bits, &v, 8);
+    return __t_mset_si(h, k, bits);
+}
+void* __t_mset_ss(void* h, char* k, char* v) {
+    __t_map_hdr* x = (__t_map_hdr*)h;
+    __t_mnode* n = __t_mfind_s(h, k);
+    if (n) { free(k); free((void*)n->val); n->val = (long long)v; return h; }
+    if ((x->len + 1) * 4 > x->cap * 3) { h = __t_mgrow(h); x = (__t_map_hdr*)h; }
+    long long hh = __t_mhash_s(k);
+    __t_mnode* nn = __t_mnode_new();
+    nn->hash = hh; nn->key = (long long)k; nn->val = (long long)v;
+    nn->next = __t_mbuckets(h)[hh & (x->cap - 1)];
+    __t_mbuckets(h)[hh & (x->cap - 1)] = nn;
+    x->len++;
+    return h;
+}
+
+// del：命中则 len--、释放节点与 str 部件；不存在静默（同 darr pop 不报错）
+void __t_mdel_ii(void* h, long long k) {
+    __t_map_hdr* x = (__t_map_hdr*)h;
+    long long idx = __t_mhash_i(k) & (x->cap - 1);
+    __t_mnode** pp = &__t_mbuckets(h)[idx];
+    while (*pp) {
+        if ((*pp)->key == k) { __t_mnode* t = *pp; *pp = t->next; free(t); x->len--; return; }
+        pp = &(*pp)->next;
+    }
+}
+void __t_mdel_if(void* h, long long k) { __t_mdel_ii(h, k); }
+void __t_mdel_is(void* h, long long k) {
+    __t_map_hdr* x = (__t_map_hdr*)h;
+    long long idx = __t_mhash_i(k) & (x->cap - 1);
+    __t_mnode** pp = &__t_mbuckets(h)[idx];
+    while (*pp) {
+        if ((*pp)->key == k) { __t_mnode* t = *pp; *pp = t->next; free((void*)t->val); free(t); x->len--; return; }
+        pp = &(*pp)->next;
+    }
+}
+void __t_mdel_si(void* h, const char* k) {
+    __t_map_hdr* x = (__t_map_hdr*)h;
+    long long idx = __t_mhash_s(k) & (x->cap - 1);
+    __t_mnode** pp = &__t_mbuckets(h)[idx];
+    while (*pp) {
+        if (!strcmp((char*)(*pp)->key, k)) { __t_mnode* t = *pp; *pp = t->next; free((void*)t->key); free(t); x->len--; return; }
+        pp = &(*pp)->next;
+    }
+}
+void __t_mdel_sf(void* h, const char* k) { __t_mdel_si(h, k); }
+void __t_mdel_ss(void* h, const char* k) {
+    __t_map_hdr* x = (__t_map_hdr*)h;
+    long long idx = __t_mhash_s(k) & (x->cap - 1);
+    __t_mnode** pp = &__t_mbuckets(h)[idx];
+    while (*pp) {
+        if (!strcmp((char*)(*pp)->key, k)) { __t_mnode* t = *pp; *pp = t->next; free((void*)t->key); free((void*)t->val); free(t); x->len--; return; }
+        pp = &(*pp)->next;
+    }
+}
+
+// free：整体深释放（首字母=键、末字母=值，s 表示释放对应 str）；if(!h)return
+void __t_mfree_ii(void* h) {
+    if (!h) return;
+    __t_map_hdr* x = (__t_map_hdr*)h;
+    for (long long i = 0; i < x->cap; i++) {
+        __t_mnode* n = __t_mbuckets(h)[i];
+        while (n) { __t_mnode* nx = n->next; free(n); n = nx; }
+    }
+    free(h);
+}
+void __t_mfree_if(void* h) { __t_mfree_ii(h); }
+void __t_mfree_is(void* h) {
+    if (!h) return;
+    __t_map_hdr* x = (__t_map_hdr*)h;
+    for (long long i = 0; i < x->cap; i++) {
+        __t_mnode* n = __t_mbuckets(h)[i];
+        while (n) { __t_mnode* nx = n->next; free((void*)n->val); free(n); n = nx; }
+    }
+    free(h);
+}
+void __t_mfree_si(void* h) {
+    if (!h) return;
+    __t_map_hdr* x = (__t_map_hdr*)h;
+    for (long long i = 0; i < x->cap; i++) {
+        __t_mnode* n = __t_mbuckets(h)[i];
+        while (n) { __t_mnode* nx = n->next; free((void*)n->key); free(n); n = nx; }
+    }
+    free(h);
+}
+void __t_mfree_sf(void* h) { __t_mfree_si(h); }
+void __t_mfree_ss(void* h) {
+    if (!h) return;
+    __t_map_hdr* x = (__t_map_hdr*)h;
+    for (long long i = 0; i < x->cap; i++) {
+        __t_mnode* n = __t_mbuckets(h)[i];
+        while (n) { __t_mnode* nx = n->next; free((void*)n->key); free((void*)n->val); free(n); n = nx; }
+    }
+    free(h);
+}

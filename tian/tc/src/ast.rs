@@ -22,6 +22,9 @@ pub enum Ty {
     /// v4.5 元组：索引 Program.tuples（规范第 24 节）。
     /// 仅存在于函数返回边界；堆块（参与天权），解构后元素按类型接管。
     Tuple(u32),
+    /// v4.7 关联数组：索引 Program.maps（规范第 25 节）。
+    /// 哈希表；键 K ∈ {i64,str}，值 V ∈ {i32,i64,f64,bool,str}；堆类型（参与天权）。
+    Map(u32),
 }
 
 impl Ty {
@@ -37,6 +40,7 @@ impl Ty {
             Ty::Arr(_) => "array",
             Ty::DArr(_) => "void*",
             Ty::Tuple(_) => "void*",
+            Ty::Map(_) => "void*",
         }
     }
 
@@ -53,6 +57,7 @@ impl Ty {
             Ty::Arr(_) => "array",
             Ty::DArr(_) => "darr",
             Ty::Tuple(_) => "tuple",
+            Ty::Map(_) => "map",
         }
     }
 
@@ -79,12 +84,24 @@ impl Ty {
     pub fn is_tuple(&self) -> bool {
         matches!(self, Ty::Tuple(_))
     }
+
+    /// v4.7：关联数组类型（堆类型，规范第 25 节）
+    pub fn is_map(&self) -> bool {
+        matches!(self, Ty::Map(_))
+    }
 }
 
 /// v4.5 元组类型定义：元素类型列表（2–4 个，规范第 24 节）
 #[derive(Debug, Clone)]
 pub struct TupleDef {
     pub elems: Vec<Ty>,
+}
+
+/// v4.7 关联数组类型定义：键类型 K + 值类型 V（规范第 25 节）
+#[derive(Debug, Clone)]
+pub struct MapDef {
+    pub key: Ty,
+    pub val: Ty,
 }
 
 /// v4.0 动态数组类型定义：元素类型（长度运行时决定，规范第 22 节）
@@ -192,6 +209,15 @@ pub enum Expr {
     Push { arr: Box<Expr>, value: Box<Expr> },
     /// v4.1 移除末元素（语句级）：pop(a)，长度必须 > 0（规范第 22 节）
     Pop { arr: Box<Expr> },
+    /// v4.7 map 字面量：map[K]V{ k1: v1, k2: v2 }（可为空 {}，规范第 25 节）
+    MapLit {
+        map: u32,
+        entries: Vec<(Expr, Expr)>,
+    },
+    /// v4.7 键存在性：has(m, k) → bool（表达式，规范第 25 节）
+    Has { map: Box<Expr>, key: Box<Expr> },
+    /// v4.7 删除键：del(m, k)（语句级，规范第 25 节）
+    Del { map: Box<Expr>, key: Box<Expr> },
     /// v4.2 子串：sub(s, start, n)，产生新所有权的堆串（规范第 23 节）
     Sub {
         s: Box<Expr>,
@@ -303,6 +329,8 @@ pub struct Program {
     pub darrs: Vec<DArrDef>,
     /// v4.5 元组类型表（顺序即 Ty::Tuple 的索引）
     pub tuples: Vec<TupleDef>,
+    /// v4.7 关联数组类型表（顺序即 Ty::Map 的索引）
+    pub maps: Vec<MapDef>,
     /// v3.6 use 导入的模块名（按出现顺序，供 fmt 重建源码）
     pub uses: Vec<String>,
     pub funcs: Vec<FnDef>,

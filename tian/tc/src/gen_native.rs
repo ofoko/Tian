@@ -19,7 +19,7 @@ use cranelift_module::{default_libcall_names, DataDescription, DataId, FuncId, L
 use cranelift_object::{ObjectBuilder, ObjectModule};
 
 use crate::ast::*;
-use crate::type_check::{arrs, collect_str_decls, consumes_var, darr_by_id, darrs, is_owned, norm, set_arrs, set_darrs, set_structs, set_tuples, structs, FuncSig};
+use crate::type_check::{arrs, collect_str_decls, consumes_var, darr_by_id, darrs, is_owned, map_by_id, maps, norm, set_arrs, set_darrs, set_structs, set_tuples, structs, FuncSig};
 
 /// 指针类型：64 位宿主（aarch64/x86_64）为 I64
 fn ptr_ty() -> Type {
@@ -40,6 +40,8 @@ fn cl_ty(t: Ty) -> Type {
         Ty::Arr(_) => ptr_ty(),
         // v4.0：动态数组 = 堆指针（规范第 22 节）
         Ty::DArr(_) => ptr_ty(),
+        // v4.7：关联数组 = 堆指针（规范第 25 节）
+        Ty::Map(_) => ptr_ty(),
         // v4.5：元组 = 指向 malloc 块的堆指针（规范第 24 节；仅存在于返回边界）
         Ty::Tuple(_) => ptr_ty(),
     }
@@ -66,6 +68,7 @@ pub fn generate_object(prog: &Program) -> Result<Vec<u8>, String> {
     set_arrs(&prog.arrs);
     set_darrs(&prog.darrs);
     set_tuples(&prog.tuples);
+    crate::type_check::set_maps(&prog.maps);
 
     // 模块级字符串字面量池：全局去重，命名全局唯一（跨函数共享）
     let mut str_pool: HashMap<String, DataId> = HashMap::new();
@@ -162,6 +165,35 @@ struct Runtime {
     dset_f: FuncId,
     dpush_i: FuncId,
     dpush_f: FuncId,
+    // v4.7：关联数组运行时导入（规范第 25 节）
+    mnew: FuncId,
+    mlen: FuncId,
+    mhas_i: FuncId,
+    mhas_s: FuncId,
+    mget_ii: FuncId,
+    mget_if: FuncId,
+    mget_is: FuncId,
+    mget_si: FuncId,
+    mget_sf: FuncId,
+    mget_ss: FuncId,
+    mset_ii: FuncId,
+    mset_if: FuncId,
+    mset_is: FuncId,
+    mset_si: FuncId,
+    mset_sf: FuncId,
+    mset_ss: FuncId,
+    mdel_ii: FuncId,
+    mdel_if: FuncId,
+    mdel_is: FuncId,
+    mdel_si: FuncId,
+    mdel_sf: FuncId,
+    mdel_ss: FuncId,
+    mfree_ii: FuncId,
+    mfree_if: FuncId,
+    mfree_is: FuncId,
+    mfree_si: FuncId,
+    mfree_sf: FuncId,
+    mfree_ss: FuncId,
 }
 
 impl Runtime {
@@ -211,6 +243,35 @@ impl Runtime {
             dset_f: mk("__t_dset_f", vec![ptr_ty(), types::I64, types::F64], None),
             dpush_i: mk("__t_dpush_i", vec![ptr_ty(), types::I64], Some(ptr_ty())),
             dpush_f: mk("__t_dpush_f", vec![ptr_ty(), types::F64], Some(ptr_ty())),
+            // v4.7：关联数组（规范第 25 节）；has 返回 long long（0/1），视同 seq 读低 32 位
+            mnew: mk("__t_mnew", vec![types::I64], Some(ptr_ty())),
+            mlen: mk("__t_mlen", vec![ptr_ty()], Some(types::I64)),
+            mhas_i: mk("__t_mhas_i", vec![ptr_ty(), types::I64], Some(types::I32)),
+            mhas_s: mk("__t_mhas_s", vec![ptr_ty(), ptr_ty()], Some(types::I32)),
+            mget_ii: mk("__t_mget_ii", vec![ptr_ty(), types::I64], Some(types::I64)),
+            mget_if: mk("__t_mget_if", vec![ptr_ty(), types::I64], Some(types::F64)),
+            mget_is: mk("__t_mget_is", vec![ptr_ty(), types::I64], Some(ptr_ty())),
+            mget_si: mk("__t_mget_si", vec![ptr_ty(), ptr_ty()], Some(types::I64)),
+            mget_sf: mk("__t_mget_sf", vec![ptr_ty(), ptr_ty()], Some(types::F64)),
+            mget_ss: mk("__t_mget_ss", vec![ptr_ty(), ptr_ty()], Some(ptr_ty())),
+            mset_ii: mk("__t_mset_ii", vec![ptr_ty(), types::I64, types::I64], Some(ptr_ty())),
+            mset_if: mk("__t_mset_if", vec![ptr_ty(), types::I64, types::F64], Some(ptr_ty())),
+            mset_is: mk("__t_mset_is", vec![ptr_ty(), types::I64, ptr_ty()], Some(ptr_ty())),
+            mset_si: mk("__t_mset_si", vec![ptr_ty(), ptr_ty(), types::I64], Some(ptr_ty())),
+            mset_sf: mk("__t_mset_sf", vec![ptr_ty(), ptr_ty(), types::F64], Some(ptr_ty())),
+            mset_ss: mk("__t_mset_ss", vec![ptr_ty(), ptr_ty(), ptr_ty()], Some(ptr_ty())),
+            mdel_ii: mk("__t_mdel_ii", vec![ptr_ty(), types::I64], None),
+            mdel_if: mk("__t_mdel_if", vec![ptr_ty(), types::I64], None),
+            mdel_is: mk("__t_mdel_is", vec![ptr_ty(), types::I64], None),
+            mdel_si: mk("__t_mdel_si", vec![ptr_ty(), ptr_ty()], None),
+            mdel_sf: mk("__t_mdel_sf", vec![ptr_ty(), ptr_ty()], None),
+            mdel_ss: mk("__t_mdel_ss", vec![ptr_ty(), ptr_ty()], None),
+            mfree_ii: mk("__t_mfree_ii", vec![ptr_ty()], None),
+            mfree_if: mk("__t_mfree_if", vec![ptr_ty()], None),
+            mfree_is: mk("__t_mfree_is", vec![ptr_ty()], None),
+            mfree_si: mk("__t_mfree_si", vec![ptr_ty()], None),
+            mfree_sf: mk("__t_mfree_sf", vec![ptr_ty()], None),
+            mfree_ss: mk("__t_mfree_ss", vec![ptr_ty()], None),
         }
     }
 }
@@ -226,6 +287,129 @@ fn cname(s: &str) -> String {
         }
     }
     r
+}
+
+// ── v4.7 关联数组辅助（wire 划分与 gen_c 一致；规范第 25 节）──────────
+fn mkey_wire(t: Ty) -> &'static str {
+    if t == Ty::Str { "s" } else { "i" }
+}
+fn mval_wire(t: Ty) -> &'static str {
+    match t { Ty::Str => "s", Ty::F64 => "f", _ => "i" }
+}
+fn mget_f(rt: &Runtime, m: &MapDef) -> FuncId {
+    match (mkey_wire(m.key), mval_wire(m.val)) {
+        ("i", "i") => rt.mget_ii,
+        ("i", "f") => rt.mget_if,
+        ("i", "s") => rt.mget_is,
+        ("s", "i") => rt.mget_si,
+        ("s", "f") => rt.mget_sf,
+        _ => rt.mget_ss,
+    }
+}
+fn mset_f(rt: &Runtime, m: &MapDef) -> FuncId {
+    match (mkey_wire(m.key), mval_wire(m.val)) {
+        ("i", "i") => rt.mset_ii,
+        ("i", "f") => rt.mset_if,
+        ("i", "s") => rt.mset_is,
+        ("s", "i") => rt.mset_si,
+        ("s", "f") => rt.mset_sf,
+        _ => rt.mset_ss,
+    }
+}
+fn mdel_f(rt: &Runtime, m: &MapDef) -> FuncId {
+    match (mkey_wire(m.key), mval_wire(m.val)) {
+        ("i", "i") => rt.mdel_ii,
+        ("i", "f") => rt.mdel_if,
+        ("i", "s") => rt.mdel_is,
+        ("s", "i") => rt.mdel_si,
+        ("s", "f") => rt.mdel_sf,
+        _ => rt.mdel_ss,
+    }
+}
+fn mfree_f(rt: &Runtime, m: &MapDef) -> FuncId {
+    match (mkey_wire(m.key), mval_wire(m.val)) {
+        ("i", "i") => rt.mfree_ii,
+        ("i", "f") => rt.mfree_if,
+        ("i", "s") => rt.mfree_is,
+        ("s", "i") => rt.mfree_si,
+        ("s", "f") => rt.mfree_sf,
+        _ => rt.mfree_ss,
+    }
+}
+fn mhas_f(rt: &Runtime, m: &MapDef) -> FuncId {
+    match m.key {
+        Ty::Str => rt.mhas_s,
+        _ => rt.mhas_i,
+    }
+}
+fn mdef_of(t: Ty) -> MapDef {
+    map_by_id(&maps(), t)
+        .cloned()
+        .unwrap_or_else(|| unreachable!("非 map 类型取 mdef_of"))
+}
+
+/// map 键/值操作数 → ABI 值：str wire 走 emit_bind_native（dup/移动），
+/// 'f' 统一转 F64，'i' 统一转 I64（Bool 以 I8→I64 桥接，与 darr 槽一致）
+fn m_operand(
+    e: &Expr,
+    wire: &str,
+    ctx: &mut FnCtx,
+    builder: &mut FunctionBuilder,
+) -> Result<Value, String> {
+    if wire == "s" {
+        // v4.7：mset 接管键所有权——一律 dup 出 map 自有副本（与 C 后端 __t_dup(key) 一致），
+        // 避免 str 形参/变量键双重释放与别名悬垂（规范第 25 节）
+        let (v, _) = emit_expr(e, ctx, builder)?;
+        let d = ctx.rt.dup;
+        return call_rt(ctx, builder, d, ptr_ty(), 1, Some(ptr_ty()), &[v])?
+            .ok_or("__t_dup 无返回值".into());
+    }
+    let (v, vt) = emit_expr(e, ctx, builder)?;
+    if wire == "f" {
+        return coerce(builder, v, vt, Ty::F64);
+    }
+    if vt == Ty::Bool {
+        let b = coerce(builder, v, vt, Ty::Bool)?;
+        return Ok(builder.ins().uextend(types::I64, b));
+    }
+    coerce(builder, v, vt, Ty::I64)
+}
+
+/// map 键被 mget/has/del 只读消费（不 dup、不移动）；仅做类型 coerce 到 i64
+fn m_key_read(
+    e: &Expr,
+    wire: &str,
+    ctx: &mut FnCtx,
+    builder: &mut FunctionBuilder,
+) -> Result<Value, String> {
+    let (v, vt) = emit_expr(e, ctx, builder)?;
+    if wire == "s" {
+        Ok(v)
+    } else {
+        coerce(builder, v, vt, Ty::I64)
+    }
+}
+
+/// 构造 map 字面量：__t_mnew(8) + 逐条目 __t_mset_*（返回新句柄；规范第 25 节）
+fn emit_map_lit_native(
+    md: &MapDef,
+    entries: &[(Expr, Expr)],
+    ctx: &mut FnCtx,
+    builder: &mut FunctionBuilder,
+) -> Result<Value, String> {
+    let cap = builder.ins().iconst(types::I64, 8);
+    let mut h = call_rt(ctx, builder, ctx.rt.mnew, types::I64, 1, Some(ptr_ty()), &[cap])?
+        .ok_or("__t_mnew 无返回值")?;
+    let setf = mset_f(ctx.rt, md);
+    let kw = mkey_wire(md.key);
+    let vw = mval_wire(md.val);
+    for (k, v) in entries.iter() {
+        let ka = m_operand(k, kw, ctx, builder)?;
+        let va = m_operand(v, vw, ctx, builder)?;
+        h = call_rt(ctx, builder, setf, ptr_ty(), 3, Some(ptr_ty()), &[h, ka, va])?
+            .ok_or("__t_mset_* 无返回值")?;
+    }
+    Ok(h)
 }
 
 struct FnCtx<'a> {
@@ -444,6 +628,8 @@ fn empty_or_zero(
             Ty::Struct(_) => builder.ins().iconst(ptr_ty(), 0),
             // v4.5：元组零值 = 空指针（元组仅存在于返回边界，裸 r/ 返回 NULL 后立即被解构释放）
             Ty::Tuple(_) => builder.ins().iconst(ptr_ty(), 0),
+            // v4.7：关联数组零值 = 空指针（规范第 25 节）
+            Ty::Map(_) => builder.ins().iconst(ptr_ty(), 0),
             // 借用不可作为返回类型（检查器已拦截）
             Ty::Str | Ty::BorrowStr => unreachable!(),
         })
@@ -741,6 +927,18 @@ fn emit_stmt(
                     let fr = ctx.rt.free;
                     call_rt(ctx, builder, fr, ptr_ty(), 1, None, &[old])?;
                     builder.def_var(var, val);
+                } else if t.is_map() {
+                    // v4.7：map 声明——字面量走 __t_mnew+__t_mset；其余表达式接管指针（规范第 25 节）
+                    let val = match value {
+                        Expr::MapLit { entries, .. } => emit_map_lit_native(&mdef_of(t), entries, ctx, builder)?,
+                        _ => {
+                            let (v, vt) = emit_expr(value, ctx, builder)?;
+                            coerce(builder, v, vt, t)?
+                        }
+                    };
+                    let old = builder.use_var(var);
+                    emit_deep_free(old, t, ctx, builder)?;
+                    builder.def_var(var, val);
                 } else {
                     let val = emit_struct_rhs(value, ctx, builder)?;
                     let old = builder.use_var(var);
@@ -863,6 +1061,19 @@ fn emit_stmt(
                                 }
                                 emit_move_nulls_native(value, true, ctx, builder)?;
                                 builder.def_var(var, val);
+                            } else if t.is_map() {
+                                // v4.7：map 整体赋值——字面量 __t_mnew+__t_mset；其余表达式接管指针（规范第 25 节）
+                                let val = match value {
+                                    Expr::MapLit { entries, .. } => emit_map_lit_native(&mdef_of(t), entries, ctx, builder)?,
+                                    _ => {
+                                        let (v, vt) = emit_expr(value, ctx, builder)?;
+                                        coerce(builder, v, vt, t)?
+                                    }
+                                };
+                                emit_move_nulls_native(value, true, ctx, builder)?;
+                                let old = builder.use_var(var);
+                                emit_deep_free(old, t, ctx, builder)?;
+                                builder.def_var(var, val);
                             } else {
                                 // v3.0：结构体变量赋值——深释放旧值后接管（规范 14.4）
                                 let val = emit_struct_rhs(value, ctx, builder)?;
@@ -906,8 +1117,39 @@ fn emit_stmt(
                     Ok(())
                 }
                 Expr::Index(base, idx) => {
-                    // v4.0：动态数组 a[i] = e —— __t_dset_* 守卫（规范第 22 节）
+                    // v4.7：map 下标赋值 m[k] = v —— __t_mset_*（键接管、值 dup/移动；规范第 25 节）
                     let bt0 = emit_ty_of(base, ctx).ok_or("下标基类型未知（编译器内部错误）")?;
+                    if let Some(md) = map_by_id(&maps(), bt0).cloned() {
+                        let (bp, _) = emit_expr(base, ctx, builder)?;
+                        let kw = mkey_wire(md.key);
+                        let k = m_operand(idx, kw, ctx, builder)?;
+                        let vw = mval_wire(md.val);
+                        let va = if vw == "s" {
+                            emit_bind_native(value, ctx, builder)?
+                        } else {
+                            let (val, vt) = emit_expr(value, ctx, builder)?;
+                            if vw == "f" {
+                                coerce(builder, val, vt, Ty::F64)?
+                            } else if vt == Ty::Bool {
+                                builder.ins().uextend(types::I64, val)
+                            } else {
+                                coerce(builder, val, vt, Ty::I64)?
+                            }
+                        };
+                        let setf = mset_f(ctx.rt, &md);
+                        // v4.7：mset 可能扩容换指针，须写回基变量句柄（与 darr push 重绑一致；规范第 25 节）
+                        let nh = call_rt(ctx, builder, setf, ptr_ty(), 3, Some(ptr_ty()), &[bp, k, va])?
+                            .ok_or("__t_mset_* 无返回值")?;
+                        if let Expr::Var(n) = base.as_ref() {
+                            if let Some((var, _)) = ctx.vars.get(n) {
+                                builder.def_var(*var, nh);
+                            }
+                        }
+                        // v4.7：str 值移动后置空源（与 C 后端 move_nulls(...,true) 一致），字面量 dup 无副作用
+                        emit_move_nulls_native(value, true, ctx, builder)?;
+                        return Ok(());
+                    }
+                    // v4.0：动态数组 a[i] = e —— __t_dset_* 守卫（规范第 22 节）
                     if let Some(de) = darr_by_id(&darrs(), bt0).cloned() {
                         let (bp, _) = emit_expr(base, ctx, builder)?;
                         let (iv, it) = emit_expr(idx, ctx, builder)?;
@@ -953,6 +1195,7 @@ fn emit_stmt(
                 Ty::Arr(_) | Ty::DArr(_) => unreachable!("数组不可直接打印（检查器已拦截）"),
                 // v4.5：元组不可直接打印（仅存在于返回边界，需先解构）
                 Ty::Tuple(_) => unreachable!("元组不可直接打印（检查器已拦截）"),
+                Ty::Map(_) => unreachable!("map 不可直接打印（检查器已拦截）"),
             };
             let arg = coerce_print(builder, val, t, arg_ty)?;
             call_rt(ctx, builder, rt_fn, arg_ty, 1, None, &[arg])?;
@@ -1105,6 +1348,18 @@ fn emit_stmt(
             call_rt(ctx, builder, ctx.rt.dpop, ptr_ty(), 1, None, &[dst])?;
             Ok(())
         }
+        // v4.7：del(m, k) —— 移除键（幂等；规范第 25 节）
+        Stmt::Expr(Expr::Del { map, key }, _) => {
+            let (bp, bt) = emit_expr(map, ctx, builder)?;
+            let md = map_by_id(&maps(), bt)
+                .cloned()
+                .ok_or("del 目标必须是 map（应被 type_check 拦截）")?;
+            let kw = mkey_wire(md.key);
+            let k = m_key_read(key, kw, ctx, builder)?;
+            let delf = mdel_f(ctx.rt, &md);
+            call_rt(ctx, builder, delf, ptr_ty(), 2, None, &[bp, k])?;
+            Ok(())
+        }
         Stmt::Expr(e, _) => {
             emit_expr(e, ctx, builder)?;
             // 语句级调用可能移动了 str 实参
@@ -1229,6 +1484,8 @@ fn coerce_print(
         Ty::Bool => Ok(builder.ins().uextend(types::I32, v)),
         // v4.5：元组不可直接打印（检查器已拦截）
         Ty::Tuple(_) => unreachable!("元组不可直接打印（检查器已拦截）"),
+        // v4.7：map 不可直接打印（检查器已拦截）
+        Ty::Map(_) => unreachable!("map 不可直接打印（检查器已拦截）"),
     }
 }
 
@@ -1283,6 +1540,8 @@ fn emit_ty_of(e: &Expr, ctx: &FnCtx) -> Option<Ty> {
             match bt {
                 Ty::Arr(i) => crate::type_check::arrs().get(i as usize).map(|a| a.elem),
                 Ty::DArr(i) => darrs().get(i as usize).map(|d| d.elem),
+                // v4.7：m[k] 类型 = 值类型 V（规范第 25 节）
+                Ty::Map(i) => maps().get(i as usize).map(|m| m.val),
                 Ty::Str => Some(Ty::I64),
                 _ => None,
             }
@@ -1291,6 +1550,10 @@ fn emit_ty_of(e: &Expr, ctx: &FnCtx) -> Option<Ty> {
         Expr::ArrLit { arr, .. } => Some(Ty::Arr(*arr)),
         // v4.0：动态数组——字面量 → 类型；push 无值
         Expr::DArrLit { darr, .. } => Some(Ty::DArr(*darr)),
+        // v4.7：map 字面量 → 类型；has → bool；del 无值
+        Expr::MapLit { map, .. } => Some(Ty::Map(*map)),
+        Expr::Has { .. } => Some(Ty::Bool),
+        Expr::Del { .. } => None,
         Expr::Sub { .. } => Some(Ty::Str),
         // v4.5：元组表达式类型 = Ty::Tuple(tup)
         Expr::TupExpr { tup, .. } => Some(Ty::Tuple(*tup)),
@@ -1593,6 +1856,7 @@ fn store_field(builder: &mut FunctionBuilder, base: Value, offset: i32, ft: Ty, 
         Ty::Arr(_) | Ty::DArr(_) => unreachable!("数组不可作为结构体字段（检查器已拦截）"),
         // v4.5：元组仅存在于返回边界，不可作为结构体字段（规范 24.2）
         Ty::Tuple(_) => unreachable!("元组不可作为结构体字段（检查器已拦截）"),
+        Ty::Map(_) => unreachable!("map 不可作为结构体字段（检查器已拦截）"),
     }
 }
 
@@ -1615,6 +1879,7 @@ fn load_field(builder: &mut FunctionBuilder, base: Value, offset: i32, ft: Ty) -
         Ty::Arr(_) | Ty::DArr(_) => Err("数组不可作为结构体字段（应被 type_check 拦截）".into()),
         // v4.5：元组仅存在于返回边界，不可作为结构体字段（规范 24.2）
         Ty::Tuple(_) => Err("元组不可作为结构体字段（应被 type_check 拦截）".into()),
+        Ty::Map(_) => Err("map 不可作为结构体字段（应被 type_check 拦截）".into()),
     }
 }
 
@@ -1633,6 +1898,12 @@ fn emit_deep_free(
         };
         let f = if de.elem == Ty::Str { ctx.rt.dfree_s } else { ctx.rt.free };
         call_rt(ctx, builder, f, ptr_ty(), 1, None, &[ptr])?;
+        return Ok(());
+    }
+    if t.is_map() {
+        // v4.7：关联数组释放——按 wire 选择 __t_mfree_*，str 键/值深释放（规范第 25 节）
+        let mf = mfree_f(ctx.rt, &mdef_of(t));
+        call_rt(ctx, builder, mf, ptr_ty(), 1, None, &[ptr])?;
         return Ok(());
     }
     let id = match t {
@@ -1772,13 +2043,33 @@ fn emit_expr(
         }
         // v2.1 借用：按只读指针传递，无复制、无移动、无置空（规范 11.6）
         Expr::Borrow(inner) => {
-            let (v, _) = emit_expr(inner, ctx, builder)?;
-            Ok((v, Ty::BorrowStr))
+            // v4.7：str → &str；map/darr 借用保持原类型（只读指针传入，规范 25.6）
+            let (v, t) = emit_expr(inner, ctx, builder)?;
+            Ok((v, if t == Ty::Str { Ty::BorrowStr } else { t }))
         }
-        // v3.3/v4.0：a[i] 读 —— 定长守卫+栈槽加载；动态 __t_dget_*（规范 16.3/22）
+        // v3.3/v4.0/v4.7：a[i] 读 —— 定长守卫+栈槽加载；动态 __t_dget_*；map __t_mget_*（规范 16.3/22/25）
         Expr::Index(base, idx) => {
             let (bp, bt) = emit_expr(base, ctx, builder)?;
             let (iv, it) = emit_expr(idx, ctx, builder)?;
+            if let Some(md) = map_by_id(&maps(), bt).cloned() {
+                // v4.7：m[k] 读——键 coerced 到 i64/str，取 __t_mget_{wire}
+                let k = m_operand(idx, mkey_wire(md.key), ctx, builder)?;
+                let ret = if mval_wire(md.val) == "f" {
+                    types::F64
+                } else if mval_wire(md.val) == "s" {
+                    ptr_ty()
+                } else {
+                    types::I64
+                };
+                let r = call_rt(ctx, builder, mget_f(ctx.rt, &md), types::I64, 2, Some(ret), &[bp, k])?
+                    .ok_or("__t_mget_* 无返回值")?;
+                if md.val == Ty::Bool {
+                    // v4.6：Bool 值以 I64 槽存储，读回截断为 I8（与 darr 一致）
+                    let b = builder.ins().ireduce(types::I8, r);
+                    return Ok((b, Ty::Bool));
+                }
+                return Ok((r, md.val));
+            }
             if let Some(de) = darr_by_id(&darrs(), bt).cloned() {
                 let i = coerce(builder, iv, it, Ty::I64)?;
                 if de.elem == Ty::F64 {
@@ -1823,6 +2114,12 @@ fn emit_expr(
                 let r = call_rt(ctx, builder, ctx.rt.dlen, types::I64, 1, Some(types::I64), &[bp])?
                     .ok_or("__t_dlen 无返回值")?;
                 Ok((r, Ty::I64))
+            } else if norm(t).is_map() {
+                // v4.7：len(m) —— __t_mlen（条目数；规范第 25 节）
+                let (bp, _) = emit_expr(inner, ctx, builder)?;
+                let r = call_rt(ctx, builder, ctx.rt.mlen, types::I64, 1, Some(types::I64), &[bp])?
+                    .ok_or("__t_mlen 无返回值")?;
+                Ok((r, Ty::I64))
             } else if norm(t) == Ty::Str {
                 let (v, _) = emit_expr(inner, ctx, builder)?;
                 let r = call_rt(ctx, builder, ctx.rt.strlen, types::I64, 1, Some(types::I64), &[v])?
@@ -1852,6 +2149,22 @@ fn emit_expr(
         Expr::DArrLit { .. } => Err("动态数组字面量位置非法（应被 type_check 拦截）".into()),
         Expr::Push { .. } => Err("push 只能作为语句（应被 type_check 拦截）".into()),
         Expr::Pop { .. } => Err("pop 只能作为语句（应被 type_check 拦截）".into()),
+        // v4.7：map 字面量只在声明/赋值 RHS（见 emit_map_lit_native），不走通用表达式路径
+        Expr::MapLit { .. } => Err("map 字面量位置非法（应被 type_check 拦截）".into()),
+        // v4.7：has(m, k) → bool —— __t_mhas_{keywire}（规范第 25 节）
+        Expr::Has { map, key } => {
+            let (bp, bt) = emit_expr(map, ctx, builder)?;
+            let md = map_by_id(&maps(), bt)
+                .cloned()
+                .ok_or("has 实参必须是 map（应被 type_check 拦截）")?;
+            let kw = mkey_wire(md.key);
+            let k = m_key_read(key, kw, ctx, builder)?;
+            let hasf = mhas_f(ctx.rt, &md);
+            let r = call_rt(ctx, builder, hasf, types::I64, 2, Some(types::I64), &[bp, k])?
+                .ok_or("__t_mhas_* 无返回值")?;
+            Ok((builder.ins().ireduce(types::I8, r), Ty::Bool))
+        }
+        Expr::Del { .. } => Err("del 只能作为语句（应被 type_check 拦截）".into()),
         // v4.5：元组表达式 → malloc 块 + 逐元素存储（每元素 8 字节槽，与 C 后端布局一致；规范第 24 节）
         Expr::TupExpr { elems, tup } => {
             let td = crate::type_check::tuples()[*tup as usize].clone();
@@ -2104,6 +2417,8 @@ fn emit_expr(
                     Ty::Arr(_) | Ty::DArr(_) => Err("数组不支持 tos/copy（应被 type_check 拦截）".into()),
                     // v4.5：元组不支持 tos/copy（仅存在于返回边界，规范 24.2）
                     Ty::Tuple(_) => Err("元组不支持 tos/copy（应被 type_check 拦截）".into()),
+                    // v4.7：map 不支持 tos/copy（应被 type_check 拦截）
+                    Ty::Map(_) => Err("map 不支持 tos/copy（应被 type_check 拦截）".into()),
                 }
             }
         }
