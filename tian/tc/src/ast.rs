@@ -222,6 +222,8 @@ pub enum Expr {
     Keys(Box<Expr>),
     /// v4.7 值快照：values(m) → []V（返回新拥有的动态数组遍历用，规范 25.4）
     Values(Box<Expr>),
+    /// v4.8：动态数组原地升序排序：sort(a)（[]i64/[]f64/[]str；语句级，规范第 26 节）
+    Sort(Box<Expr>),
     /// v4.2 子串：sub(s, start, n)，产生新所有权的堆串（规范第 23 节）
     Sub {
         s: Box<Expr>,

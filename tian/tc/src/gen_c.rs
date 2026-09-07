@@ -237,6 +237,9 @@ pub fn generate(prog: &Program) -> String {
          static void* __t_mvalues_i(void* h){ __t_map_hdr* x=(__t_map_hdr*)h; void* d=__t_dnew(x->cap); for(long long i=0;i<x->cap;i++){ __t_mnode* n=__t_mbuckets(h)[i]; while(n){ __t_dpush_i(d,n->val); n=n->next; } } return d; }\n\
          static void* __t_mvalues_f(void* h){ __t_map_hdr* x=(__t_map_hdr*)h; void* d=__t_dnew(x->cap); for(long long i=0;i<x->cap;i++){ __t_mnode* n=__t_mbuckets(h)[i]; while(n){ double v; memcpy(&v,&n->val,8); __t_dpush_f(d,v); n=n->next; } } return d; }\n\
          static void* __t_mvalues_s(void* h){ __t_map_hdr* x=(__t_map_hdr*)h; void* d=__t_dnew(x->cap); for(long long i=0;i<x->cap;i++){ __t_mnode* n=__t_mbuckets(h)[i]; while(n){ __t_dpush_s(d,__t_dup((char*)n->val)); n=n->next; } } return d; }\n\
+         static void __t_sort_i(void* h){ __t_darr_hdr* x=(__t_darr_hdr*)h; long long* b=(long long*)__t_darr_data(h); long long i,j; for(i=1;i<x->len;i++){ long long t=b[i]; j=i-1; while(j>=0 && b[j]>t){ b[j+1]=b[j]; j--; } b[j+1]=t; } }\n\
+         static void __t_sort_f(void* h){ __t_darr_hdr* x=(__t_darr_hdr*)h; double* b=(double*)__t_darr_data(h); long long i,j; for(i=1;i<x->len;i++){ double t=b[i]; j=(long long)i-1; while(j>=0 && b[j]>t){ b[j+1]=b[j]; j--; } b[j+1]=t; } }\n\
+         static void __t_sort_s(void* h){ __t_darr_hdr* x=(__t_darr_hdr*)h; char** b=(char**)__t_darr_data(h); long long i,j; for(i=1;i<x->len;i++){ char* t=b[i]; j=(long long)i-1; while(j>=0 && strcmp(b[j],t)>0){ b[j+1]=b[j]; j--; } b[j+1]=t; } }\n\
          static void __t_mfree_ii(void* h){ if(!h)return; __t_map_hdr* x=(__t_map_hdr*)h; for(long long i=0;i<x->cap;i++){ __t_mnode* n=__t_mbuckets(h)[i]; while(n){ __t_mnode* nx=n->next; free(n); n=nx; } } free(h); }\n\
          static void __t_mfree_if(void* h){ __t_mfree_ii(h); }\n\
          static void __t_mfree_is(void* h){ if(!h)return; __t_map_hdr* x=(__t_map_hdr*)h; for(long long i=0;i<x->cap;i++){ __t_mnode* n=__t_mbuckets(h)[i]; while(n){ __t_mnode* nx=n->next; free((void*)n->val); free(n); n=nx; } } free(h); }\n\
@@ -1315,6 +1318,26 @@ fn emit_stmt(
             indent(out, level);
             let _ = writeln!(out, "__t_dpop({});", base_name);
         }
+        // v4.8：sort(a) —— 原地升序排序，空/单元素数组为幂等空操作（规范第 26 节）
+        Stmt::Expr(Expr::Sort(arr), _) => {
+            let base_name = match arr.as_ref() {
+                Expr::Var(n) => cname(n),
+                _ => String::new(),
+            };
+            let dt = match arr.as_ref() {
+                Expr::Var(n) => scope.get(n).map(|v| v.ty).unwrap_or(Ty::I64),
+                _ => Ty::I64,
+            };
+            let helper = match crate::type_check::darr_by_id(&crate::type_check::darrs(), dt)
+                .map(|d| d.elem)
+            {
+                Some(Ty::F64) => "__t_sort_f",
+                Some(Ty::Str) => "__t_sort_s",
+                _ => "__t_sort_i",
+            };
+            indent(out, level);
+            let _ = writeln!(out, "{}({});", helper, base_name);
+        }
         // v4.0：push(a, v) —— 可能 realloc，变量重新绑定返回的新指针（规范第 22 节）
         Stmt::Expr(Expr::Push { arr, value }, _) => {
             let (base_name, de) = match arr.as_ref() {
@@ -1571,6 +1594,7 @@ fn emit_expr(e: &Expr, scope: &Scope, sigs: &HashMap<String, FuncSig>, out: &mut
         Expr::Push { .. } => unreachable!("push 只能作为语句（检查器已拦截）"),
         Expr::Pop { .. } => unreachable!("pop 只能作为语句（检查器已拦截）"),
         Expr::Del { .. } => unreachable!("del 只能作为语句（检查器已拦截）"),
+        Expr::Sort { .. } => unreachable!("sort 只能作为语句（检查器已拦截）"),
         Expr::DArrLit { .. } => unreachable!("动态数组字面量位置非法（检查器已拦截）"),
         // v3.7：sel(条件, a, b) → C 三元表达式（惰性求值，与原生后端一致，规范第 18 节）
         Expr::Sel { cond, a, b } => {            out.push_str("((");

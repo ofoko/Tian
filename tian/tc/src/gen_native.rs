@@ -201,6 +201,10 @@ struct Runtime {
     mvalues_i: FuncId,
     mvalues_f: FuncId,
     mvalues_s: FuncId,
+    // v4.8：sort(a) 原地升序
+    sort_i: FuncId,
+    sort_f: FuncId,
+    sort_s: FuncId,
 }
 
 impl Runtime {
@@ -285,6 +289,10 @@ impl Runtime {
             mvalues_i: mk("__t_mvalues_i", vec![ptr_ty()], Some(ptr_ty())),
             mvalues_f: mk("__t_mvalues_f", vec![ptr_ty()], Some(ptr_ty())),
             mvalues_s: mk("__t_mvalues_s", vec![ptr_ty()], Some(ptr_ty())),
+            // v4.8：sort 原地排序（void in-place）
+            sort_i: mk("__t_sort_i", vec![ptr_ty()], None),
+            sort_f: mk("__t_sort_f", vec![ptr_ty()], None),
+            sort_s: mk("__t_sort_s", vec![ptr_ty()], None),
         }
     }
 }
@@ -1374,6 +1382,23 @@ fn emit_stmt(
             call_rt(ctx, builder, ctx.rt.dpop, ptr_ty(), 1, None, &[dst])?;
             Ok(())
         }
+        // v4.8：sort(a) —— 原地升序排序（[]i64/[]f64/[]str；规范第 26 节）
+        Stmt::Expr(Expr::Sort(arr), _) => {
+            let (var, t) = match arr.as_ref() {
+                Expr::Var(n) => *ctx.vars.get(n).ok_or("sort 目标未声明（编译器内部错误）")?,
+                _ => return Err("sort 实参必须是变量（应被 type_check 拦截）".into()),
+            };
+            let table = darrs();
+            let de = darr_by_id(&table, t).ok_or("sort 目标不是动态数组（应被 type_check 拦截）")?;
+            let f = match de.elem {
+                Ty::F64 => ctx.rt.sort_f,
+                Ty::Str => ctx.rt.sort_s,
+                _ => ctx.rt.sort_i,
+            };
+            let dst = builder.use_var(var);
+            call_rt(ctx, builder, f, ptr_ty(), 1, None, &[dst])?;
+            Ok(())
+        }
         // v4.7：del(m, k) —— 移除键（幂等；规范第 25 节）
         Stmt::Expr(Expr::Del { map, key }, _) => {
             let (bp, bt) = emit_expr(map, ctx, builder)?;
@@ -1585,6 +1610,7 @@ fn emit_ty_of(e: &Expr, ctx: &FnCtx) -> Option<Ty> {
         Expr::TupExpr { tup, .. } => Some(Ty::Tuple(*tup)),
         Expr::Push { .. } => None,
         Expr::Pop { .. } => None,
+        Expr::Sort { .. } => None,
         // v3.7：sel 类型 = 分支统一结果
         Expr::Sel { cond, a, b } => {
             let at = emit_ty_of(a, ctx)?;
@@ -2195,6 +2221,7 @@ fn emit_expr(
         Expr::DArrLit { .. } => Err("动态数组字面量位置非法（应被 type_check 拦截）".into()),
         Expr::Push { .. } => Err("push 只能作为语句（应被 type_check 拦截）".into()),
         Expr::Pop { .. } => Err("pop 只能作为语句（应被 type_check 拦截）".into()),
+        Expr::Sort { .. } => Err("sort 只能作为语句（应被 type_check 拦截）".into()),
         // v4.7：map 字面量只在声明/赋值 RHS（见 emit_map_lit_native），不走通用表达式路径
         Expr::MapLit { .. } => Err("map 字面量位置非法（应被 type_check 拦截）".into()),
         // v4.7：has(m, k) → bool —— __t_mhas_{keywire}（规范第 25 节）

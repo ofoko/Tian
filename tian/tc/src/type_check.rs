@@ -876,6 +876,43 @@ fn check_stmt(
                 }
                 Ok(())
             }
+            // v4.8：sort(a) 语句 —— a 必须可变动态数组变量，元素可比较（[]i64/[]f64/[]str；规范第 26 节）
+            Expr::Sort(arr) => {
+                let bn = match arr.as_ref() {
+                    Expr::Var(bn) => bn,
+                    _ => return Err(err(*line, "sort 的实参必须是动态数组变量")),
+                };
+                let info = match scope.get(bn) {
+                    Some(v) => *v,
+                    None => return Err(err(*line, format!("变量 '{}' 未声明", bn))),
+                };
+                if info.is_borrow {
+                    return Err(err(
+                        *line,
+                        format!("变量 '{}' 是借用 &[]T（只读视图），不能 sort", bn),
+                    ));
+                }
+                if !info.mutable && !info.is_param {
+                    return Err(err(
+                        *line,
+                        format!("变量 '{}' 是只读的（/ 声明），不能 sort", bn),
+                    ));
+                }
+                let table = darrs();
+                let de = darr_by_id(&table, info.ty).ok_or_else(|| {
+                    err(*line, format!("类型 {} 不能 sort（只有动态数组可以）", ty_label(info.ty, structs)))
+                })?;
+                if !matches!(de.elem, Ty::I64 | Ty::F64 | Ty::Str) {
+                    return Err(err(
+                        *line,
+                        format!(
+                            "sort 仅支持 []i64/[]f64/[]str 元素，实际 {}",
+                            de.elem.label()
+                        ),
+                    ));
+                }
+                Ok(())
+            }
             // v4.7：del(m, k) 语句 —— m 必须是可变的（非借用）map 变量；键类型匹配
             Expr::Del { map, key } => {
                 let bn = match map.as_ref() {
@@ -1244,6 +1281,7 @@ pub fn ty_of<S: TyLookup>(
         Expr::Has { .. } => Ok(Ty::Bool),
         // v4.7：del(m, k) 无值（仅语句级，规范第 25 节）
         Expr::Del { .. } => Err(err(0, "del 不产生值（只能作为语句）")),
+        Expr::Sort { .. } => Err(err(0, "sort 不产生值（只能作为语句）")),
         // v4.0/v4.1：push/pop 无值（仅语句级，规范第 22 节）
         // v4.2：sub 产生新所有权的堆串
         Expr::Sub { .. } => Ok(Ty::Str),
@@ -1988,6 +2026,8 @@ fn check_expr(
         }
         // v4.7：del(m, k) 是语句级（作表达式取值报错，规范第 25 节）
         Expr::Del { .. } => Err(err(line, "del 只能作为语句使用")),
+        // v4.8：sort(a) 是语句级（作表达式取值报错，规范第 26 节）
+        Expr::Sort { .. } => Err(err(line, "sort 只能作为语句使用")),
         // v4.7：keys(m) → 新拥有的 []K 键快照（map 或 &map 均可；规范 25.4）
         Expr::Keys(map) => {
             let bt = norm(check(map, scope)?);

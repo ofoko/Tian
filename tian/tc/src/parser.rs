@@ -503,7 +503,7 @@ impl Parser {
                 Ok(Stmt::Continue(start_line))
             }
             // v4.0：panic(msg) / check(cond, msg) 快速失败语句（规范第 21 节）
-            Tok::ConvertFn(ref n) if n == "panic" || n == "check" || n == "push" || n == "pop" || n == "del" => {
+            Tok::ConvertFn(ref n) if n == "panic" || n == "check" || n == "push" || n == "pop" || n == "del" || n == "sort" => {
                 self.bump();
                 self.expect(&Tok::LParen)?;
                 let first = self.parse_expr()?;
@@ -519,6 +519,11 @@ impl Parser {
                         Expr::Pop { arr: Box::new(first) },
                         start_line,
                     ))
+                } else if n == "sort" {
+                    // v4.8：sort(arr) 原地升序排序（规范第 26 节）
+                    self.expect(&Tok::RParen)?;
+                    self.expect_newline()?;
+                    Ok(Stmt::Expr(Expr::Sort(Box::new(first)), start_line))
                 } else if n == "del" {
                     // v4.7：del(m, key) 删除键（规范第 25 节）
                     self.expect(&Tok::Comma)?;
@@ -1102,6 +1107,13 @@ impl Parser {
                         arr: Box::new(arr),
                         value: Box::new(value),
                     });
+                }
+                // v4.8：sort(a) 原地升序（语句级，[]i64/[]f64/[]str；规范第 26 节）
+                if name == "sort" {
+                    self.expect(&Tok::LParen)?;
+                    let arr = self.parse_expr()?;
+                    self.expect(&Tok::RParen)?;
+                    return Ok(Expr::Sort(Box::new(arr)));
                 }
                 // v4.7：has(m, k) 键存在性（表达式，规范第 25 节）
                 if name == "has" {

@@ -287,6 +287,41 @@ void* __t_mvalues_s(void* h) {
     return d;
 }
 
+// sort：动态数组原地升序排序（插入排序；[]i64/[]f64/[]str），void 不重绑
+void __t_sort_i(void* h) {
+    __t_darr_hdr* x = (__t_darr_hdr*)h;
+    long long* b = (long long*)__t_darr_data(h);
+    long long i, j;
+    for (i = 1; i < x->len; i++) {
+        long long t = b[i];
+        j = i - 1;
+        while (j >= 0 && b[j] > t) { b[j + 1] = b[j]; j--; }
+        b[j + 1] = t;
+    }
+}
+void __t_sort_f(void* h) {
+    __t_darr_hdr* x = (__t_darr_hdr*)h;
+    double* b = (double*)__t_darr_data(h);
+    long long i, j;
+    for (i = 1; i < x->len; i++) {
+        double t = b[i];
+        j = i - 1;
+        while (j >= 0 && b[j] > t) { b[j + 1] = b[j]; j--; }
+        b[j + 1] = t;
+    }
+}
+void __t_sort_s(void* h) {
+    __t_darr_hdr* x = (__t_darr_hdr*)h;
+    char** b = (char**)__t_darr_data(h);
+    long long i, j;
+    for (i = 1; i < x->len; i++) {
+        char* t = b[i];
+        j = i - 1;
+        while (j >= 0 && strcmp(b[j], t) > 0) { b[j + 1] = b[j]; j--; }
+        b[j + 1] = t;
+    }
+}
+
 // has：命中 bool，未命中不 panic
 long long __t_mhas_i(void* h, long long k) { return __t_mfind_i(h, k) != NULL; }
 long long __t_mhas_s(void* h, const char* k) { return __t_mfind_s(h, k) != NULL; }
