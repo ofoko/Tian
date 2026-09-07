@@ -1,0 +1,21 @@
+# 流程控制与函数：while、if/else、函数、返回零值
+//cnt=0
+w/cnt<3{
+    i/cnt==1{
+        `cnt
+    }e/{
+        `0-cnt
+    }
+    cnt=cnt+1
+}
+f/max(x:i64,y:i64):i64{
+    i/x>y{
+        r/x
+    }
+    r/y
+}
+`max(3,9)
+f/nothing():i64{
+    r/
+}
+`nothing()

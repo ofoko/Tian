@@ -79,6 +79,10 @@ pub struct VarInfo {
     pub mutable: bool,
     /// 天权 v2.0：str 所有权是否已被移走（仅 str 有意义）
     pub moved: bool,
+    /// v4.1：是否为函数形参（动态数组 push/pop 允许在形参上原地修改后交还）
+    pub is_param: bool,
+    /// v4.3：是否为动态数组借用形参 &[]T（只读视图，规范 22.8）
+    pub is_borrow: bool,
 }
 
 impl VarInfo {
@@ -87,6 +91,19 @@ impl VarInfo {
             ty,
             mutable,
             moved: false,
+            is_param: false,
+            is_borrow: false,
+        }
+    }
+
+    /// v4.1：形参绑定（只读，但动态数组允许 push/pop 原地修改后交还）
+    pub fn new_param(ty: Ty, is_borrow: bool) -> Self {
+        VarInfo {
+            ty,
+            mutable: false,
+            moved: false,
+            is_param: true,
+            is_borrow,
         }
     }
 }
@@ -97,16 +114,23 @@ pub type Scope = HashMap<String, VarInfo>;
 #[derive(Debug, Clone)]
 pub struct FuncSig {
     pub params: Vec<Ty>,
+    /// v4.3：与 params 对齐——动态数组借用形参标记（不移动、不置空源）
+    pub borrows: Vec<bool>,
     pub ret: Ty,
 }
 
 /// 入口：校验整个程序
 pub fn check(prog: &Program) -> Result<(), CheckError> {
+    // v3.3/v4.0：数组类型表供 ty_label 报错使用
+    set_arrs(&prog.arrs);
+    set_darrs(&prog.darrs);
+    set_tuples(&prog.tuples);
     // 函数表（定义顺序无关）
     let mut funcs: HashMap<String, FuncSig> = HashMap::new();
     for f in &prog.funcs {
         let sig = FuncSig {
             params: f.params.iter().map(|p| p.ty.unwrap_or(Ty::I64)).collect(),
+            borrows: f.params.iter().map(|p| p.borrow && p.ty.map(|t| t.is_darr()).unwrap_or(false)).collect(),
             ret: f.ret.unwrap_or(Ty::I64),
         };
         if funcs.insert(f.name.clone(), sig).is_some() {
@@ -115,6 +139,13 @@ pub fn check(prog: &Program) -> Result<(), CheckError> {
         // v2.1：返回类型不能是借用（借用不可逃逸，规范 11.6.5）
         if f.ret == Some(Ty::BorrowStr) {
             return Err(err(0, format!("函数 '{}' 的返回类型不能是借用 &str", f.name)));
+        }
+        // v3.4：数组可作为参数（只读视图传递，参数本就不可写，规范 16.6）；返回值仍不支持
+        if f.ret.map(|t| t.is_arr()).unwrap_or(false) {
+            return Err(err(
+                0,
+                format!("函数 '{}' 的返回类型不能是数组（规范 16.5）", f.name),
+            ));
         }
         // 参数重复检查
         let mut seen = std::collections::HashSet::new();
@@ -137,13 +168,20 @@ pub fn check(prog: &Program) -> Result<(), CheckError> {
                     format!("结构体 '{}' 的字段 '{}' 不能是借用 &str（借用不可存储在结构体中）", sd.name, f.name),
                 ));
             }
+            // v3.3/v4.0：数组不能作为结构体字段
+            if f.ty.is_arr() || f.ty.is_darr() {
+                return Err(err(
+                    f.line,
+                    format!("结构体 '{}' 的字段 '{}' 不能是数组类型（v3.3 暂不支持）", sd.name, f.name),
+                ));
+            }
         }
     }
 
     // 顶层语句（全局作用域，r/ 禁止出现在顶层）
     let mut top_scope: Scope = HashMap::new();
     for s in &prog.top {
-        check_stmt(s, &mut top_scope, &funcs, &prog.structs, false, Ty::I64)?;
+        check_stmt(s, &mut top_scope, &funcs, &prog.structs, false, Ty::I64, false)?;
     }
 
     // 函数体：作用域仅含自身参数（规范 5.3：函数不可访问顶层变量）
@@ -155,12 +193,12 @@ pub fn check(prog: &Program) -> Result<(), CheckError> {
             .map(|p| {
                 (
                     p.name.clone(),
-                    VarInfo::new(p.ty.unwrap_or(Ty::I64), false),
+                    VarInfo::new_param(p.ty.unwrap_or(Ty::I64), p.borrow),
                 )
             })
             .collect();
         for s in &f.body {
-            check_stmt(s, &mut scope, &funcs, &prog.structs, true, ret)?;
+            check_stmt(s, &mut scope, &funcs, &prog.structs, true, ret, false)?;
         }
         // v2.2：语义锚点静态校验（规范第 12 节）
         check_contracts(f, &funcs, &prog.structs, ret)?;
@@ -180,7 +218,7 @@ fn check_contracts(
     let base: Scope = f
         .params
         .iter()
-        .map(|p| (p.name.clone(), VarInfo::new(p.ty.unwrap_or(Ty::I64), false)))
+        .map(|p| (p.name.clone(), VarInfo::new_param(p.ty.unwrap_or(Ty::I64), p.borrow)))
         .collect();
     for c in &f.contracts {
         match c {
@@ -287,6 +325,7 @@ fn check_stmt(
     structs: &[StructDef],
     in_fn: bool,
     fn_ret: Ty,
+    in_loop: bool,
 ) -> Result<(), CheckError> {
     match s {
         Stmt::Decl {
@@ -320,6 +359,19 @@ fn check_stmt(
             }
             // 天权：str / 结构体绑定移动 RHS 的所有权（规范 11.2 / 14.4）
             if is_owned(target) {
+                // v4.2：str 动态数组元素是容器的借用视图，不可取得所有权（容器负责释放，规范 22.6）
+                if let Expr::Index(base, _) = value {
+                    let bty = ty_of(base, scope, funcs, structs).ok();
+                    if let Some(Ty::DArr(_)) = bty {
+                        let et = ty_of(value, scope, funcs, structs).ok();
+                        if et == Some(Ty::Str) {
+                            return Err(err(
+                                *line,
+                                "不能把动态数组的 str 元素移出为所有者（容器负责释放；需要副本用 copy(a[i])）",
+                            ));
+                        }
+                    }
+                }
                 // v3.0：结构体字段只能借用、不能移出（否则字段与结构体双释放，规范 14.4）
                 if matches!(value, Expr::Field(..)) {
                     return Err(err(
@@ -333,6 +385,54 @@ fn check_stmt(
                 mark_top_move(value, scope);
             }
             scope.insert(name.clone(), VarInfo::new(target, *mutable));
+            Ok(())
+        }
+        // v4.5：多声明解构 //a, b = f(...)（规范 24.3）
+        // 元组仅存在于函数返回边界，因此右侧必须是返回元组的调用；
+        // 每个元素按其类型接管所有权（天权按元素接管，规范 24.4）
+        Stmt::MultiDecl {
+            mutable,
+            names,
+            value,
+            line,
+        } => {
+            let vt = check_expr(value, scope, funcs, structs, *line)?;
+            let table = tuples();
+            let td = match tuple_by_id(&table, vt) {
+                Some(td) => td,
+                None => {
+                    return Err(err(
+                        *line,
+                        "解构赋值的右侧必须是返回元组的函数调用（元组仅存在于返回边界，不可作为值出现）",
+                    ))
+                }
+            };
+            if names.len() != td.elems.len() {
+                return Err(err(
+                    *line,
+                    format!(
+                        "解构数量不符：左侧 {} 个，元组 {} 个元素",
+                        names.len(),
+                        td.elems.len()
+                    ),
+                ));
+            }
+            for n in names {
+                if scope.contains_key(n) {
+                    return Err(err(*line, format!("变量 '{}' 重复声明", n)));
+                }
+            }
+            for (i, n) in names.iter().enumerate() {
+                let et = td.elems[i];
+                // 借用不持有所有权，无法接管为独立变量（规范 11.6.5）
+                if et == Ty::BorrowStr {
+                    return Err(err(
+                        *line,
+                        format!("解构的第 {} 个元素是借用 &str，不能取得所有权", i + 1),
+                    ));
+                }
+                scope.insert(n.clone(), VarInfo::new(et, *mutable));
+            }
             Ok(())
         }
         // v3.0：左侧可为变量或字段（p.x = e，规范 14.3）
@@ -380,7 +480,77 @@ fn check_stmt(
                     }
                     (None, ft)
                 }
-                _ => return Err(err(*line, "赋值的左侧只能是变量或 变量.字段")),
+                Expr::Index(base, idx) => {
+                    // v3.3：数组下标赋值 a[i] = e（规范 16.3）
+                    let bn = match base.as_ref() {
+                        Expr::Var(bn) => bn,
+                        _ => return Err(err(*line, "数组下标赋值的左侧只能是数组变量（如 a[i]=1）")),
+                    };
+                    let info = match scope.get(bn) {
+                        Some(v) => *v,
+                        None => return Err(err(*line, format!("变量 '{}' 未声明", bn))),
+                    };
+                    let darr_param = info.is_param && info.ty.is_darr();
+                    if !info.mutable && !darr_param {
+                        return Err(err(
+                            *line,
+                            format!("变量 '{}' 是只读的（/ 声明），不能修改其元素", bn),
+                        ));
+                    }
+                    let it = check_expr(idx, scope, funcs, structs, *line)?;
+                    if !matches!(it, Ty::I32 | Ty::I64) {
+                        return Err(err(
+                            *line,
+                            format!("数组下标必须是整数，实际 {}", ty_label(it, structs)),
+                        ));
+                    }
+                    // v4.2：str 不可按下标赋值（str 不可变，规范第 23 节）
+                    if norm(info.ty) == Ty::Str {
+                        return Err(err(*line, "str 不可按下标赋值（str 不可变；用拼接构造新串）"));
+                    }
+                    if info.is_borrow {
+                        return Err(err(
+                            *line,
+                            format!("变量 '{}' 是借用 &[]T（只读视图），不能修改其元素", bn),
+                        ));
+                    }
+                    // v4.0：动态数组下标赋值——长度运行时决定，仅静态检查（规范第 22 节）
+                    let dtable = darrs();
+                    if let Some(d) = darr_by_id(&dtable, info.ty) {
+                        if let Expr::Neg(x) = &**idx {
+                            if matches!(x.as_ref(), Expr::Int(_)) {
+                                return Err(err(*line, "数组下标不能为负"));
+                            }
+                        }
+                        (None, d.elem)
+                    } else {
+                        let table = arrs();
+                        let a = arr_by_id(&table, info.ty).ok_or_else(|| {
+                            err(
+                                *line,
+                                format!("类型 {} 不能按下标赋值（左侧必须是数组）", ty_label(info.ty, structs)),
+                            )
+                        })?;
+                        if let Expr::Int(n) = &**idx {
+                            if *n < 0 || *n as u64 >= a.len {
+                                return Err(err(
+                                    *line,
+                                    format!("下标 {} 越界：数组长度为 {}（合法范围 0..{}）", n, a.len, a.len - 1),
+                                ));
+                            }
+                        }
+                        if let Expr::Neg(x) = &**idx {
+                            if let Expr::Int(n) = x.as_ref() {
+                                return Err(err(
+                                    *line,
+                                    format!("下标 -{} 越界：数组下标不能为负（合法范围 0..{}）", n, a.len - 1),
+                                ));
+                            }
+                        }
+                        (None, a.elem)
+                    }
+                }
+                _ => return Err(err(*line, "赋值的左侧只能是变量、变量.字段 或 数组元素 a[i]")),
             };
             let vt = check_expr(value, scope, funcs, structs, *line)?;
             if !assign_compatible(target_ty, vt, value) {
@@ -395,6 +565,19 @@ fn check_stmt(
             }
             // 天权：整体接收所有权（移动进入 + 复活，规范 11.2.3 / 14.4）
             if is_owned(target_ty) {
+                // v4.2：str 动态数组元素是借用视图，不可取得所有权（规范 22.6）
+                if let Expr::Index(base, _) = value {
+                    let bty = ty_of(base, scope, funcs, structs).ok();
+                    if let Some(Ty::DArr(_)) = bty {
+                        let et = ty_of(value, scope, funcs, structs).ok();
+                        if et == Some(Ty::Str) {
+                            return Err(err(
+                                *line,
+                                "不能把动态数组的 str 元素移出为所有者（容器负责释放；需要副本用 copy(a[i])）",
+                            ));
+                        }
+                    }
+                }
                 if matches!(value, Expr::Field(..)) {
                     return Err(err(
                         *line,
@@ -422,6 +605,16 @@ fn check_stmt(
                     ),
                 ));
             }
+            // v3.3/v4.0：数组整体不可打印
+            if t.is_arr() || t.is_darr() {
+                return Err(err(
+                    *line,
+                    format!(
+                        "不能直接打印数组 '{}'（请打印元素如 `a[0]，或长度 `len(a)）",
+                        ty_label(t, structs)
+                    ),
+                ));
+            }
             Ok(())
         }
         Stmt::While { cond, body, line } => {
@@ -431,7 +624,7 @@ fn check_stmt(
             }
             with_block_scope(scope, |s| {
                 for st in body {
-                    check_stmt(st, s, funcs, structs, in_fn, fn_ret)?;
+                    check_stmt(st, s, funcs, structs, in_fn, fn_ret, true)?;
                 }
                 Ok(())
             })
@@ -443,14 +636,14 @@ fn check_stmt(
             }
             with_block_scope(scope, |s| {
                 for st in body {
-                    check_stmt(st, s, funcs, structs, in_fn, fn_ret)?;
+                    check_stmt(st, s, funcs, structs, in_fn, fn_ret, in_loop)?;
                 }
                 Ok(())
             })?;
             if let Some(eb) = else_body {
                 with_block_scope(scope, |s| {
                     for st in eb {
-                        check_stmt(st, s, funcs, structs, in_fn, fn_ret)?;
+                        check_stmt(st, s, funcs, structs, in_fn, fn_ret, in_loop)?;
                     }
                     Ok(())
                 })?;
@@ -468,6 +661,24 @@ fn check_stmt(
                     return Err(err(
                         *line,
                         "借用不能逃逸函数（&str 形参不可返回；需要所有权请用 copy() 产生新所有者）",
+                    ));
+                }
+                // v4.3：借用动态数组形参不可作为返回值（借用不逃逸，规范 22.8）
+                if fn_ret.is_darr() {
+                    if let Expr::Var(n) = expr {
+                        if scope.get(n).map(|v| v.is_borrow).unwrap_or(false) {
+                            return Err(err(
+                                *line,
+                                "借用 &[]T 不可逃逸函数（&[]T 形参不可返回；需要所有权请让调用方持有）",
+                            ));
+                        }
+                    }
+                }
+                // v4.0：动态数组返回值只能是变量或函数调用（字面量无法在表达式位构造，规范 22.4）
+                if fn_ret.is_darr() && !matches!(expr, Expr::Var(_) | Expr::Call { .. }) {
+                    return Err(err(
+                        *line,
+                        "动态数组返回值只能是数组变量或函数调用（字面量请先赋给变量）",
                     ));
                 }
                 // v0.3：返回类型须与标注一致（提升规则见 value_assignable，规范 5.3）
@@ -494,20 +705,147 @@ fn check_stmt(
             }
             Ok(())
         }
+        // v4.0：panic(msg) / check(cond, msg) 快速失败（规范第 21 节）
+        Stmt::Panic(msg, line) => {
+            let t = check_expr(msg, scope, funcs, structs, *line)?;
+            if t != Ty::Str {
+                return Err(err(*line, format!("panic 消息必须是 str，实际 {}", ty_label(t, structs))));
+            }
+            Ok(())
+        }
+        Stmt::Check(cond, msg, line) => {
+            let ct = check_expr(cond, scope, funcs, structs, *line)?;
+            if ct != Ty::Bool {
+                return Err(err(*line, format!("check 条件必须是 bool，实际 {}", ty_label(ct, structs))));
+            }
+            let mt = check_expr(msg, scope, funcs, structs, *line)?;
+            if mt != Ty::Str {
+                return Err(err(*line, format!("check 消息必须是 str，实际 {}", ty_label(mt, structs))));
+            }
+            Ok(())
+        }
+        // v3.8：break / continue 仅限 w/ 循环体内（规范第 19 节）
+        Stmt::Break(line) => {
+            if !in_loop {
+                return Err(err(*line, "break 只能出现在 w/ 循环体内"));
+            }
+            Ok(())
+        }
+        Stmt::Continue(line) => {
+            if !in_loop {
+                return Err(err(*line, "continue 只能出现在 w/ 循环体内"));
+            }
+            Ok(())
+        }
         Stmt::Expr(e, line) => match e {
             Expr::Call { .. } => {
                 check_expr(e, scope, funcs, structs, *line)?;
                 Ok(())
             }
-            _ => Err(err(*line, "语句级表达式只能是函数调用")),
+            // v4.0：push(a, v) 语句 —— a 必须是可变的动态数组变量（规范第 22 节）
+            Expr::Push { arr, value } => {
+                let bn = match arr.as_ref() {
+                    Expr::Var(bn) => bn,
+                    _ => return Err(err(*line, "push 的实参必须是动态数组变量")),
+                };
+                let info = match scope.get(bn) {
+                    Some(v) => *v,
+                    None => return Err(err(*line, format!("变量 '{}' 未声明", bn))),
+                };
+                if info.is_borrow {
+                    return Err(err(
+                        *line,
+                        format!("变量 '{}' 是借用 &[]T（只读视图），不能 push", bn),
+                    ));
+                }
+                if !info.mutable && !info.is_param {
+                    return Err(err(
+                        *line,
+                        format!("变量 '{}' 是只读的（/ 声明），不能 push", bn),
+                    ));
+                }
+                let dtable = darrs();
+                let d = darr_by_id(&dtable, info.ty).ok_or_else(|| {
+                    err(*line, format!("类型 {} 不能 push（只有动态数组可以）", ty_label(info.ty, structs)))
+                })?;
+                let vt = check_expr(value, scope, funcs, structs, *line)?;
+                if !value_assignable(d.elem, vt, value) {
+                    return Err(err(
+                        *line,
+                        format!("push 元素期望 {}，实际 {}", d.elem.label(), ty_label(vt, structs)),
+                    ));
+                }
+                // v4.2：str 元素移交所有权进容器（字面量由编译器 dup，规范 22.6）
+                if d.elem == Ty::Str {
+                    mark_top_move(value, scope);
+                }
+                Ok(())
+            }
+            // v4.1：pop(a) 语句 —— a 必须是可变的动态数组变量
+            Expr::Pop { arr } => {
+                let bn = match arr.as_ref() {
+                    Expr::Var(bn) => bn,
+                    _ => return Err(err(*line, "pop 的实参必须是动态数组变量")),
+                };
+                let info = match scope.get(bn) {
+                    Some(v) => *v,
+                    None => return Err(err(*line, format!("变量 '{}' 未声明", bn))),
+                };
+                if info.is_borrow {
+                    return Err(err(
+                        *line,
+                        format!("变量 '{}' 是借用 &[]T（只读视图），不能 pop", bn),
+                    ));
+                }
+                if !info.mutable && !info.is_param {
+                    return Err(err(
+                        *line,
+                        format!("变量 '{}' 是只读的（/ 声明），不能 pop", bn),
+                    ));
+                }
+                if darr_by_id(&darrs(), info.ty).is_none() {
+                    return Err(err(
+                        *line,
+                        format!("类型 {} 不能 pop（只有动态数组可以）", ty_label(info.ty, structs)),
+                    ));
+                }
+                Ok(())
+            }
+            _ => Err(err(*line, "语句级表达式只能是函数调用或 push")),
         },
+    }
+}
+
+/// v3.7：sel 分支类型统一（规范第 18 节）——同型或按提升规则统一到更大类型；
+/// 仅数值与 bool（str/结构体/数组分支会造成堆值泄漏或语义复杂化，不支持）
+fn sel_unify(at: Ty, bt: Ty, structs: &[StructDef], line: usize) -> Result<Ty, CheckError> {
+    let ok_ty = |t: Ty| matches!(t, Ty::I32 | Ty::I64 | Ty::F64 | Ty::Bool);
+    if !ok_ty(at) || !ok_ty(bt) {
+        return Err(err(
+            line,
+            format!(
+                "sel 分支只能是数值或 bool（实际 {} 与 {}）；str/结构体/数组不支持",
+                ty_label(at, structs),
+                ty_label(bt, structs)
+            ),
+        ));
+    }
+    if at == bt {
+        return Ok(at);
+    }
+    match (at, bt) {
+        (Ty::I64, Ty::I32) | (Ty::I32, Ty::I64) => Ok(Ty::I64),
+        (Ty::F64, Ty::I32) | (Ty::I32, Ty::F64) | (Ty::F64, Ty::I64) | (Ty::I64, Ty::F64) => Ok(Ty::F64),
+        _ => Err(err(
+            line,
+            format!("sel 两分支类型不符：{} 与 {}", ty_label(at, structs), ty_label(bt, structs)),
+        )),
     }
 }
 
 /// 传参 / 返回值兼容规则（规范 5.3）：同型；I32→I64 提升；整数→F64 提升；
 /// I32 目标仅接受范围内整数字面量
-fn ty_assignable(expected: Ty, actual: Ty) -> bool {
-    if expected == actual {
+fn ty_assignable(expected: Ty, actual: Ty) -> bool {    if expected == actual {
         return true;
     }
     match (expected, actual) {
@@ -551,7 +889,7 @@ pub fn norm(t: Ty) -> Ty {
 /// v3.0：受天权所有权约束的堆类型——str 与结构体（规范 11.2 / 14.4）。
 /// 赋值、传参、返回均移动所有权；数值与 bool 为纯值类型，不参与。
 pub fn is_owned(t: Ty) -> bool {
-    t == Ty::Str || t.is_struct()
+    t == Ty::Str || t.is_struct() || t.is_darr()
 }
 
 // ── v3.0 结构体表（代码生成侧共享）──────────────────────────────
@@ -600,7 +938,84 @@ pub fn ty_label(t: Ty, structs: &[StructDef]) -> String {
             .get(i as usize)
             .map(|s| s.name.clone())
             .unwrap_or_else(|| "struct".into()),
+        Ty::Arr(i) => arrs()
+            .get(i as usize)
+            .map(|a| format!("{}[{}]", a.elem.label(), a.len))
+            .unwrap_or_else(|| "array".into()),
+        Ty::DArr(i) => darrs()
+            .get(i as usize)
+            .map(|d| format!("[]{}", d.elem.label()))
+            .unwrap_or_else(|| "darr".into()),
         other => other.label().to_string(),
+    }
+}
+
+// ── v3.3 数组类型表（代码生成侧共享，机制同 STRUCTS）────────────
+thread_local! {
+    static ARRS: std::cell::RefCell<Vec<ArrDef>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// 设置当前线程的数组类型表（后端入口调用）
+pub fn set_arrs(arrs: &[ArrDef]) {
+    ARRS.with(|a| *a.borrow_mut() = arrs.to_vec());
+}
+
+/// 读取当前线程的数组类型表快照
+pub fn arrs() -> Vec<ArrDef> {
+    ARRS.with(|a| a.borrow().clone())
+}
+
+/// v3.3：按 Ty::Arr 索引取数组定义
+pub fn arr_by_id<'a>(arrs: &'a [ArrDef], t: Ty) -> Option<&'a ArrDef> {
+    match t {
+        Ty::Arr(i) => arrs.get(i as usize),
+        _ => None,
+    }
+}
+
+// ── v4.0 动态数组类型表（机制同 ARRS）────────────────────────────
+thread_local! {
+    static DARRS: std::cell::RefCell<Vec<DArrDef>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// 设置当前线程的动态数组类型表（后端入口调用）
+pub fn set_darrs(darrs: &[DArrDef]) {
+    DARRS.with(|d| *d.borrow_mut() = darrs.to_vec());
+}
+
+/// 读取当前线程的动态数组类型表快照
+pub fn darrs() -> Vec<DArrDef> {
+    DARRS.with(|d| d.borrow().clone())
+}
+
+/// v4.0：按 Ty::DArr 索引取定义
+pub fn darr_by_id<'a>(darrs: &'a [DArrDef], t: Ty) -> Option<&'a DArrDef> {
+    match t {
+        Ty::DArr(i) => darrs.get(i as usize),
+        _ => None,
+    }
+}
+
+// ── v4.5 元组类型表（机制同 ARRS/DARRS；规范第 24 节）────────────────
+thread_local! {
+    static TUPLES: std::cell::RefCell<Vec<TupleDef>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// 设置当前线程的元组类型表（检查入口与后端入口均调用）
+pub fn set_tuples(tuples: &[TupleDef]) {
+    TUPLES.with(|t| *t.borrow_mut() = tuples.to_vec());
+}
+
+/// 读取当前线程的元组类型表快照
+pub fn tuples() -> Vec<TupleDef> {
+    TUPLES.with(|t| t.borrow().clone())
+}
+
+/// v4.5：按 Ty::Tuple 索引取元组定义
+pub fn tuple_by_id<'a>(tuples: &'a [TupleDef], t: Ty) -> Option<&'a TupleDef> {
+    match t {
+        Ty::Tuple(i) => tuples.get(i as usize),
+        _ => None,
     }
 }
 
@@ -657,6 +1072,77 @@ pub fn ty_of<S: TyLookup>(
         Expr::StructLit { name, .. } => struct_by_name(structs, name)
             .map(|(i, _)| Ty::Struct(i))
             .ok_or_else(|| err(0, format!("未知结构体 '{}'", name))),
+        // v3.3：数组字面量类型 = 对应数组类型（元素校验在 check_expr）
+        Expr::ArrLit { arr, .. } => {
+            if arrs().get(*arr as usize).is_none() {
+                return Err(err(0, "内部错误：数组类型索引越界"));
+            }
+            Ok(Ty::Arr(*arr))
+        }
+        // v3.3：a[i] 类型 = 元素类型（下标校验在 check_expr）
+        Expr::Index(base, idx) => {
+            let bt = norm(ty_of(base, scope, funcs, structs)?);
+            let it = norm(ty_of(idx, scope, funcs, structs)?);
+            if !matches!(it, Ty::I32 | Ty::I64) {
+                return Err(err(0, format!("数组下标必须是整数，实际 {}", ty_label(it, structs))));
+            }
+            // v4.2：str 下标读 → 字节 i64（规范第 23 节）
+            if bt == Ty::Str {
+                return Ok(Ty::I64);
+            }
+            let table = arrs();
+            if let Some(a) = arr_by_id(&table, bt) {
+                return Ok(a.elem);
+            }
+            let dtable = darrs();
+            let d = darr_by_id(&dtable, bt).ok_or_else(|| {
+                err(0, format!("类型 {} 不能取下标（只有数组和 str 能用 [i]）", ty_label(bt, structs)))
+            })?;
+            Ok(d.elem)
+        }
+        // v4.2：sub 产生新所有权的堆串（规范第 23 节）
+        Expr::Sub { .. } => Ok(Ty::Str),
+        // v4.0：动态数组字面量类型
+        Expr::DArrLit { darr, .. } => {
+            if darrs().get(*darr as usize).is_none() {
+                return Err(err(0, "内部错误：动态数组类型索引越界"));
+            }
+            Ok(Ty::DArr(*darr))
+        }
+        // v4.0/v4.1：push/pop 无值（仅语句级，规范第 22 节）
+        // v4.2：sub 产生新所有权的堆串
+        Expr::Sub { .. } => Ok(Ty::Str),
+        Expr::Push { .. } => Err(err(0, "push 不产生值（只能作为语句）")),
+        Expr::Pop { .. } => Err(err(0, "pop 不产生值（只能作为语句）")),
+        // v3.3：len(a) 为编译期常量 i64；len(s) 为 UTF-8 字节数
+        Expr::Len(inner) => {
+            let t = norm(ty_of(inner, scope, funcs, structs)?);
+            if t.is_arr() || t == Ty::Str || t.is_darr() {
+                return Ok(Ty::I64);
+            }
+            Err(err(0, format!("len() 只能用于数组或 str，实际 {}", ty_label(t, structs))))
+        }
+        // v3.7：sel(cond, a, b) —— 仅数值/bool 分支；类型按提升规则统一（规范第 18 节）
+        Expr::Sel { cond, a, b } => {
+            let ct = norm(ty_of(cond, scope, funcs, structs)?);
+            if ct != Ty::Bool {
+                return Err(err(0, format!("sel 条件必须是 bool，实际 {}", ty_label(ct, structs))));
+            }
+            let at = norm(ty_of(a, scope, funcs, structs)?);
+            let bt = norm(ty_of(b, scope, funcs, structs)?);
+            sel_unify(at, bt, structs, 0)
+        }
+        // v4.5：元组表达式（仅返回边界合法，规范 24.2）
+        Expr::TupExpr { elems, tup } => {
+            let table = tuples();
+            let td = table
+                .get(*tup as usize)
+                .ok_or_else(|| err(0, "内部错误：元组类型索引越界"))?;
+            if elems.len() != td.elems.len() {
+                return Err(err(0, "元组元素个数与声明不符（内部错误）"));
+            }
+            Ok(Ty::Tuple(*tup))
+        }
         Expr::Neg(e) => {
             let t = ty_of(e, scope, funcs, structs)?;
             if t.is_numeric() {
@@ -699,6 +1185,17 @@ pub fn ty_of<S: TyLookup>(
                 }
             }
         }
+        // v4.3：宽松推导（借用合法性由 check_expr 严格校验，规范 11.6 / 22.8）
+        Expr::Borrow(inner) => {
+            let t = ty_of(inner, scope, funcs, structs)?;
+            if t == Ty::Str {
+                Ok(Ty::BorrowStr)
+            } else if t.is_darr() {
+                Ok(t)
+            } else {
+                Err(err(0, format!("只能借用 str 或动态数组，实际 {}", t.label())))
+            }
+        }
         Expr::Call { name, args } => {
             // v0.3：调用类型 = 声明的返回类型，实参按形参类型校验（规范 5.3）
             let sig = funcs
@@ -723,6 +1220,14 @@ pub fn ty_of<S: TyLookup>(
         }
         Expr::Convert { name, arg } => {
             let t = ty_of(arg, scope, funcs, structs)?;
+            if name == "tof" {
+                // v4.4：tof(s) str → f64（运行时 strtod 全量消费，规范第 7 节）
+                let nt = norm(t);
+                if nt != Ty::Str {
+                    return Err(err(0, format!("tof 实参必须是 str，实际 {}", ty_label(t, structs))));
+                }
+                return Ok(Ty::F64);
+            }
             if name == "toi" {
                 match t {
                     Ty::I32 | Ty::I64 | Ty::F64 => Ok(Ty::I64),
@@ -738,15 +1243,6 @@ pub fn ty_of<S: TyLookup>(
             } else {
                 // tos：数字/bool → str；str 原样
                 Ok(Ty::Str)
-            }
-        }
-        // v2.1：借用表达式类型为 &str（仅出现在 &str 形参实参位，规范 11.6）
-        Expr::Borrow(inner) => {
-            let t = ty_of(inner, scope, funcs, structs)?;
-            if t == Ty::Str {
-                Ok(Ty::BorrowStr)
-            } else {
-                Err(err(0, format!("只能借用 str，实际 {}", t.label())))
             }
         }
     }
@@ -770,6 +1266,20 @@ pub fn collect_str_decls(
                 scope.insert(name.clone(), t);
                 if is_owned(t) && !out.contains(name) {
                     out.push(name.clone());
+                }
+            }
+            // v4.5：多声明解构——owned 元素各自成为堆槽（规范 24.3）
+            Stmt::MultiDecl { names, value, .. } => {
+                let vt = ty_of(value, scope, sigs, structs).unwrap_or(Ty::I64);
+                let table = tuples();
+                if let Some(td) = tuple_by_id(&table, vt) {
+                    for (i, n) in names.iter().enumerate() {
+                        let t = td.elems.get(i).copied().unwrap_or(Ty::I64);
+                        scope.insert(n.clone(), t);
+                        if is_owned(t) && !out.contains(n) {
+                            out.push(n.clone());
+                        }
+                    }
                 }
             }
             Stmt::While { cond, body, .. } => {
@@ -885,9 +1395,14 @@ fn check_expr(
                 Err(err(line, format!("类型 {} 与 {} 不参与算术运算 {}", lt.label(), rt.label(), op.c_str())))
             }
         }
-        Expr::Borrow(_) => {
-            // 借用只允许出现在 &str 形参实参位置（Call 分支已特判），其余位置非法（规范 11.6.3）
-            Err(err(line, "借用 & 只能作为 &str 形参的实参使用（v2.1）"))
+        Expr::Borrow(inner) => {
+            // v4.3：宽松推导（借用合法性由 check_expr 严格校验，规范 11.6 / 22.8）
+            let t = ty_of(inner, scope, funcs, structs)?;
+            if t == Ty::Str || t.is_darr() {
+                Ok(if t == Ty::Str { Ty::BorrowStr } else { t })
+            } else {
+                Err(err(0, format!("只能借用 str 或动态数组，实际 {}", t.label())))
+            }
         }
         Expr::Call { name, args } => {
             let sig = match funcs.get(name) {
@@ -909,15 +1424,42 @@ fn check_expr(
                 ));
             }
             // 天权：str 形参按序移动实参所有权（规范 11.2）；&str 形参只借用（规范 11.6）
-            for (a, pt) in args.iter().zip(&sig.params) {
+            for (ai, (a, pt)) in args.iter().zip(&sig.params).enumerate() {
                 if *pt == Ty::BorrowStr {
                     // 借用形参：实参必须是 &变量（不移动源，规范 11.6.1/11.6.2），
                     // 或字符串字面量（静态存储，天然只读出借）
                     match a {
                         Expr::Str(_) => continue,
+                        // v4.2：借用形参可原样转借给下一个 &str 形参（视图无所有权，规范 23.4）
+                        Expr::Var(n) if scope.get(n).map(|v| v.ty) == Some(Ty::BorrowStr) => continue,
                         Expr::Borrow(inner) => {
+                            // v3.1：&p.f 借用 str 字段（只读视图，不移动不释放，规范 14.4.4）
+                            if let Expr::Field(base, fname) = inner.as_ref() {
+                                let bt = check(base, scope)?;
+                                let sd = match bt {
+                                    Ty::Struct(idx) => structs.get(idx as usize).ok_or_else(|| {
+                                        err(line, "内部错误：结构体索引越界".to_string())
+                                    })?,
+                                    other => {
+                                        return Err(err(
+                                            line,
+                                            format!("只能借用 str 变量或结构体的 str 字段，实际 {}", other.label()),
+                                        ))
+                                    }
+                                };
+                                let ft = field_ty(sd, fname).ok_or_else(|| {
+                                    err(line, format!("结构体 '{}' 没有字段 '{}'", sd.name, fname))
+                                })?;
+                                if ft != Ty::Str {
+                                    return Err(err(
+                                        line,
+                                        format!("字段 '{}' 不是 str 类型，只能借用 str 字段", fname),
+                                    ));
+                                }
+                                continue;
+                            }
                             if !matches!(inner.as_ref(), Expr::Var(_)) {
-                                return Err(err(line, "借用 & 只能作用于 str 变量"));
+                                return Err(err(line, "借用 & 只能作用于 str 变量或 str 字段（&变量 或 &变量.字段）"));
                             }
                             let t = check(inner, scope)?;
                             if t != Ty::Str {
@@ -940,10 +1482,107 @@ fn check_expr(
                     ));
                 }
                 let at = check(a, scope)?;
+                // v3.4：数组实参 = 只读视图传递；实参必须是数组变量（字面量无存储，规范 16.6）
+                if pt.is_arr() {
+                    if !matches!(a, Expr::Var(_)) {
+                        return Err(err(
+                            line,
+                            format!("函数 '{}' 的数组形参只接受数组变量实参（只读视图传递）", name),
+                        ));
+                    }
+                    if at != *pt {
+                        return Err(err(
+                            line,
+                            format!(
+                                "函数 '{}' 的数组形参期望 {}，实际 {}",
+                                name,
+                                ty_label(*pt, structs),
+                                ty_label(at, structs)
+                            ),
+                        ));
+                    }
+                    continue;
+                }
                 if !value_assignable(*pt, at, a) {
                     return Err(err(
                         line,
                         format!("函数 '{}' 的参数期望 {}，实际 {}", name, pt.label(), at.label()),
+                    ));
+                }
+                // v4.3：借用 &[]T 形参——实参必须是数组变量（只读视图，不移动），不可是借用变量转 owned
+                let is_borrow_param = sig.borrows.get(ai).copied().unwrap_or(false);
+                if is_borrow_param {
+                    // v4.3：&h 与 h 均可（借用视图，& 只是语法糖，规范 22.8）
+                    let arg_var = match a {
+                        Expr::Var(n) => Some(n.clone()),
+                        Expr::Borrow(inner) => match inner.as_ref() {
+                            Expr::Var(n) => Some(n.clone()),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(n) = arg_var {
+                        let info = scope.get(&n).copied();
+                        match info {
+                            None => return Err(err(line, format!("变量 '{}' 未声明", n))),
+                            Some(v) => {
+                                if v.is_borrow {
+                                    continue; // 借用转借（视图无所有权）
+                                }
+                                if darr_by_id(&darrs(), v.ty).is_none() {
+                                    return Err(err(
+                                        line,
+                                        format!("函数 '{}' 的 &[]T 形参期望动态数组变量", name),
+                                    ));
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    if matches!(a, Expr::Call { .. }) {
+                        continue;
+                    }
+                    return Err(err(
+                        line,
+                        format!("函数 '{}' 的 &[]T 形参只接受数组变量实参", name),
+                    ));
+                }
+                // v4.5：元组不可作为实参（仅存在于返回边界，规范 24.5）
+                if at.is_tuple() || pt.is_tuple() {
+                    return Err(err(
+                        line,
+                        format!("函数 '{}' 的元组不可作为实参（元组仅用于返回边界）", name),
+                    ));
+                }
+                // v4.0：动态数组形参移动所有权；实参只能是变量或函数调用
+                if pt.is_darr() && !matches!(a, Expr::Var(_) | Expr::Call { .. }) {
+                    // v4.3：借用语法 &h 不可传给接管所有权的形参（语义混淆，规范 22.8）
+                    if let Expr::Borrow(inner) = a {
+                        if let Expr::Var(n) = inner.as_ref() {
+                            return Err(err(
+                                line,
+                                format!(
+                                    "不能把借用 '&{}' 传给接管所有权的形参（去掉 & 传值，或把形参改为 &[]T）",
+                                    n
+                                ),
+                            ));
+                        }
+                    }
+                    // 借用变量不可作为 owned []T 实参（视图无所有权，规范 22.8）
+                    if let Expr::Var(n) = a {
+                        if scope.get(n).map(|v| v.is_borrow).unwrap_or(false) {
+                            return Err(err(
+                                line,
+                                format!(
+                                    "不能把借用变量 '{}' 传给接管所有权的形参（借用视图无所有权）",
+                                    n
+                                ),
+                            ));
+                        }
+                    }
+                    return Err(err(
+                        line,
+                        format!("函数 '{}' 的动态数组实参只能是数组变量或函数调用", name),
                     ));
                 }
                 // v3.0：str 与结构体形参都接管所有权（规范 14.4）
@@ -1039,16 +1678,192 @@ fn check_expr(
             }
             Ok(ty)
         }
+        // v3.3：数组字面量——元素个数与类型严格校验（规范 16.2）
+        Expr::ArrLit { arr, elems } => {
+            let table = arrs();
+            let a = table
+                .get(*arr as usize)
+                .ok_or_else(|| err(line, "内部错误：数组类型索引越界"))?;
+            if elems.len() as u64 != a.len {
+                return Err(err(
+                    line,
+                    format!("数组 {}[{}] 期望 {} 个元素，实际 {} 个", a.elem.label(), a.len, a.len, elems.len()),
+                ));
+            }
+            for (i, e) in elems.iter().enumerate() {
+                let vt = check(e, scope)?;
+                if !value_assignable(a.elem, vt, e) {
+                    return Err(err(
+                        line,
+                        format!(
+                            "数组元素 #{} 期望 {}，实际 {}",
+                            i,
+                            a.elem.label(),
+                            ty_label(vt, structs)
+                        ),
+                    ));
+                }
+            }
+            Ok(Ty::Arr(*arr))
+        }
+        // v3.3/v4.0：数组下标——基表达式必须是数组变量；定长数组做编译期越界检查
+        Expr::Index(base, idx) => {
+            if !matches!(base.as_ref(), Expr::Var(_)) {
+                return Err(err(line, "数组下标的左侧只能是数组变量（如 a[i]）"));
+            }
+            let bt = check(base, scope)?;
+            let nt = norm(bt);
+            let it = check(idx, scope)?;
+            if !matches!(it, Ty::I32 | Ty::I64) {
+                return Err(err(
+                    line,
+                    format!("数组下标必须是整数，实际 {}", ty_label(it, structs)),
+                ));
+            }
+            // v4.2：str 下标读（字节）——运行时越界守卫
+            if nt == Ty::Str {
+                return Ok(Ty::I64);
+            }
+            let table = arrs();
+            if let Some(a) = arr_by_id(&table, nt) {
+                if let Expr::Int(n) = &**idx {
+                    if *n < 0 || *n as u64 >= a.len {
+                        return Err(err(
+                            line,
+                            format!("下标 {} 越界：数组长度为 {}（合法范围 0..{}）", n, a.len, a.len - 1),
+                        ));
+                    }
+                }
+                // 负号字面量 -1 被解析为 Neg(Int)，同样做编译期检查
+                if let Expr::Neg(x) = &**idx {
+                    if let Expr::Int(n) = x.as_ref() {
+                        return Err(err(
+                            line,
+                            format!("下标 -{} 越界：数组下标不能为负（合法范围 0..{}）", n, a.len - 1),
+                        ));
+                    }
+                }
+                return Ok(a.elem);
+            }
+            // v4.0：动态数组——长度运行时决定，仅静态检查
+            let dtable = darrs();
+            let d = darr_by_id(&dtable, nt).ok_or_else(|| {
+                err(
+                    line,
+                    format!("类型 {} 不能取下标（只有数组能用 [i]）", ty_label(nt, structs)),
+                )
+            })?;
+            Ok(d.elem)
+        }
+        // v4.0：动态数组字面量——元素类型校验（个数不限，规范第 22 节）
+        Expr::DArrLit { darr, elems } => {
+            let table = darrs();
+            let d = table
+                .get(*darr as usize)
+                .ok_or_else(|| err(line, "内部错误：动态数组类型索引越界"))?;
+            for (i, e) in elems.iter().enumerate() {
+                let vt = check(e, scope)?;
+                if !value_assignable(d.elem, vt, e) {
+                    return Err(err(
+                        line,
+                        format!(
+                            "动态数组元素 #{} 期望 {}，实际 {}",
+                            i,
+                            d.elem.label(),
+                            ty_label(vt, structs)
+                        ),
+                    ));
+                }
+            }
+            Ok(Ty::DArr(*darr))
+        }
+        // v3.5/v4.0：len —— 定长数组 / str / 动态数组
+        Expr::Len(inner) => {
+            let t = check(inner, scope)?;
+            let nt = norm(t);
+            if !nt.is_arr() && nt != Ty::Str && !nt.is_darr() {
+                return Err(err(
+                    line,
+                    format!("len() 只能用于数组或 str，实际 {}", ty_label(nt, structs)),
+                ));
+            }
+            Ok(Ty::I64)
+        }
+        // v4.0/v4.1：push/pop 不是表达式（语句级，规范第 22 节）
+        // v4.2：sub(s, start, n) —— s 为 str，start/n 为整数（规范第 23 节）
+        Expr::Sub { s, start, n } => {
+            let st = check(s, scope)?;
+            if norm(st) != Ty::Str {
+                return Err(err(line, format!("sub 实参必须是 str，实际 {}", ty_label(norm(st), structs))));
+            }
+            for (label, e) in [("start", start), ("n", n)] {
+                let t = check(e, scope)?;
+                if !matches!(t, Ty::I32 | Ty::I64) {
+                    return Err(err(
+                        line,
+                        format!("sub 的 {} 必须是整数，实际 {}", label, ty_label(t, structs)),
+                    ));
+                }
+            }
+            Ok(Ty::Str)
+        }
+        Expr::Push { .. } => Err(err(line, "push 只能作为语句使用")),
+        Expr::Pop { .. } => Err(err(line, "pop 只能作为语句使用")),
+        // v3.7：sel 条件表达式严格校验（带行号；规范第 18 节）
+        Expr::Sel { cond, a, b } => {
+            let ct = check(cond, scope)?;
+            if ct != Ty::Bool {
+                return Err(err(line, format!("sel 条件必须是 bool，实际 {}", ty_label(ct, structs))));
+            }
+            let at = check(a, scope)?;
+            let bt = check(b, scope)?;
+            sel_unify(at, bt, structs, line)
+        }
+        // v4.5：元组构造表达式（规范第 24 节）
+        Expr::TupExpr { elems, tup } => {
+            let table = tuples();
+            let td = table
+                .get(*tup as usize)
+                .ok_or_else(|| err(line, "内部错误：元组类型索引越界"))?;
+            if elems.len() != td.elems.len() {
+                return Err(err(line, "元组元素个数与声明不符（内部错误）"));
+            }
+            for e in elems.iter() {
+                check(e, scope)?;
+            }
+            Ok(Ty::Tuple(*tup))
+        }
         Expr::Convert { name, arg } => {
             if name == "copy" {
                 // copy(s)/copy(&s)：只借用源变量，产生新的独立所有者（规范 11.2.4/11.2.5/11.6.4）
-                let t = check(arg, scope)?;
+                let t = match arg.as_ref() {
+                    // copy(&s)：借用 → 所有权（规范 11.6.4 逃逸合法路径）
+                    Expr::Borrow(inner) => {
+                        if !matches!(inner.as_ref(), Expr::Var(_)) {
+                            return Err(err(line, "借用 & 只能作用于 str 变量"));
+                        }
+                        let inner_t = check(inner, scope)?;
+                        if inner_t != Ty::Str {
+                            return Err(err(line, format!("只能借用 str，实际 {}", inner_t.label())));
+                        }
+                        Ty::BorrowStr
+                    }
+                    _ => check(arg, scope)?,
+                };
                 if t != Ty::Str && t != Ty::BorrowStr {
                     return Err(err(line, format!("copy() 只能用于 str，实际 {}", t.label())));
                 }
                 return Ok(Ty::Str);
             }
             let t = check(arg, scope)?;
+            if name == "tof" {
+                // v4.4：tof(s) —— 实参必须是 str（运行时快速失败，规范第 7 节）
+                let nt = norm(t);
+                if nt != Ty::Str {
+                    return Err(err(line, format!("tof 实参必须是 str，实际 {}", ty_label(nt, structs))));
+                }
+                return Ok(Ty::F64);
+            }
             if name == "toi" {
                 match t {
                     Ty::I32 | Ty::I64 | Ty::F64 => Ok(Ty::I64),
@@ -1231,8 +2046,8 @@ mod tests {
     #[test]
     fn test_borrow_ok() {
         // 借用传参不移动源：调用后 s 仍可用、仍可移动（规范 11.6.1/11.6.2）
-        assert!(check_src("f/len(x:&str):i64{\nr/1\n}\n//s=\"a\"\n/g=len(&s)\n`s\n").is_ok());
-        assert!(check_src("f/len(x:&str):i64{\nr/1\n}\n//s=\"a\"\n/g=len(&s)\n//t=s\n").is_ok());
+        assert!(check_src("f/lenstr(x:&str):i64{\nr/1\n}\n//s=\"a\"\n/g=lenstr(&s)\n`s\n").is_ok());
+        assert!(check_src("f/lenstr(x:&str):i64{\nr/1\n}\n//s=\"a\"\n/g=lenstr(&s)\n//t=s\n").is_ok());
         // 借用形参可拼接、可比较、可打印（只读位视同 str）
         assert!(check_src("f/shout(x:&str):str{\nr/x+\"!\"\n}\n").is_ok());
         assert!(check_src("f/eq(x:&str):bool{\nr/x==\"a\"\n}\n").is_ok());
@@ -1243,7 +2058,7 @@ mod tests {
     #[test]
     fn test_borrow_rejects() {
         // 借用形参的实参缺 & 前缀
-        let e = check_src("f/len(x:&str):i64{\nr/1\n}\n//s=\"a\"\nlen(s)\n").unwrap_err();
+        let e = check_src("f/lenstr(x:&str):i64{\nr/1\n}\n//s=\"a\"\nlenstr(s)\n").unwrap_err();
         assert!(e.contains("& 前缀"), "实际报错：{}", e);
         // 值形参（接管所有权）收到借用
         let e = check_src("f/g(x:str){`x\n}\n//s=\"a\"\ng(&s)\n").unwrap_err();
@@ -1260,7 +2075,7 @@ mod tests {
         // 借用在其他表达式位置非法
         assert!(check_src("//s=\"a\"\n//t=&s\n").is_err());
         // 对已移动变量借用 = use-after-move
-        let e = check_src("f/len(x:&str):i64{\nr/1\n}\n//s=\"a\"\n//t=s\nlen(&s)\n").unwrap_err();
+        let e = check_src("f/lenstr(x:&str):i64{\nr/1\n}\n//s=\"a\"\n//t=s\nlenstr(&s)\n").unwrap_err();
         assert!(e.contains("已被移动"), "实际报错：{}", e);
     }
 

@@ -1,0 +1,34 @@
+# v3.8 break / continue
+//i=0
+w/true{
+    i=i+1
+    i/i==3{
+        break
+    }
+}
+`i
+//n=0
+//s=0
+w/n<5{
+    n=n+1
+    i/n==2{
+        continue
+    }
+    s=s+n
+}
+`s
+# 嵌套循环：break 只跳出内层
+//x=0
+//o=0
+w/o<2{
+    o=o+1
+    //j=0
+    w/true{
+        j=j+1
+        i/j==2{
+            break
+        }
+    }
+    x=x+j
+}
+`x
