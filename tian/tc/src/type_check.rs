@@ -2784,4 +2784,14 @@ mod tests {
         let e = check_src("f/h(a:i64,b:i64):(i64,i64){r/a,b}\n`sel(true, h(1,2), h(2,3))\n").unwrap_err();
         assert!(e.contains("sel"), "tuple-sel 实际报错：{}", e);
     }
+
+    #[test]
+    fn test_json_t_module_validate_check() {
+        // v5.0 修复 demo/json.t：纯库模块（enum Json + parse_* + validate）
+        // 必须可独立通过 parse+check（无顶层语句、无 main 亦合法）。
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../demo/json.t");
+        let src = std::fs::read_to_string(&p).expect("读取 demo/json.t 失败");
+        let prog = parse(lex_spanned(&src).expect("lex json.t")).expect("parse json.t");
+        check(&prog).expect("check json.t 应无类型错误");
+    }
 }

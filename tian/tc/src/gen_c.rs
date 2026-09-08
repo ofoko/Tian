@@ -2222,4 +2222,19 @@ f/pair(n:i64):(i64, str){
         // owned 元素槽由 prologue 预声明为 NULL 指针
         assert!(c.contains("const char* t_label = NULL;"), "生成的 C：\n{}", c);
     }
+
+    #[test]
+    fn test_json_t_validate_gen_c() {
+        // v5.0 修复：demo/json.t 新增 validate(s:&str)；assert C 后端正确生成
+        // validate 函数，且末尾检查 check(end==n) 落为 __t_panic 守卫。
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../demo/json.t");
+        let src = std::fs::read_to_string(&p).expect("读取 demo/json.t 失败");
+        let prog = parse(lex_spanned(&src).expect("lex json.t")).expect("parse json.t");
+        check(&prog).expect("check json.t 应无类型错误");
+        let c = generate(&prog);
+        // validate 函数以 const char* 签名生成（cname("validate")="t_validate"）
+        assert!(c.contains("static long long t_validate(const char* t_s)"), "应生成 validate 签名：\n{}", c);
+        // check(end==n, "JSON 结尾有多余字符") 落为 __t_panic(__t_dup(...)) 守卫
+        assert!(c.contains("__t_panic(__t_dup(\"JSON 结尾有多余字符\"))"), "末尾检查 guard 缺失：\n{}", c);
+    }
 }
