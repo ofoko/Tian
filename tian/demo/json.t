@@ -218,43 +218,12 @@ f/parse_value(s:&str, i:i64):(Json,i64){
     panic("意外的 JSON 值")
 }
 
-# ---- 主流程 ----
-# 根为数组：混合类型的 JSON 值 + 内嵌对象（统计键数）
-//json_text="[123,true,null,\"hi\",{\"a\":1,\"b\":[2,3]}]"
-` "=== 递归下降解析（构建 Json 枚举 AST） ==="
-//v, end = parse_value(&json_text, 0)
-check(end==len(json_text), "JSON 结尾有多余字符")
-` "解析成功（已消费全部字节，末尾无多余字符）"
-` ""
-` "=== 顶层数组元素类型（借用 items[i] 逐元素 match，不释放容器） ==="
-match v {
-    Json::Arr(items) => {
-        //i=0
-        w/i<len(items){
-            //y=items[i]
-            match y {
-                Json::Num(x) => { ` "  ["+tos(i)+"] Num("+tos(x)+")" }
-                Json::Bool(b) => {
-                    i/b{
-                        ` "  ["+tos(i)+"] Bool(true)"
-                    }e/{
-                        ` "  ["+tos(i)+"] Bool(false)"
-                    }
-                }
-                Json::Null => { ` "  ["+tos(i)+"] Null" }
-                Json::Str(s) => { ` "  ["+tos(i)+"] Str(\""+s+"\")" }
-                Json::Arr(a2) => { ` "  ["+tos(i)+"] Arr["+tos(len(a2))+"]" }
-                Json::Obj(o2) => { //ks2=keys(o2)
-                    ` "  ["+tos(i)+"] Obj{"+tos(len(ks2))+"}" }
-            }
-            i=i+1
-        }
-        //cnt=i
-        ` "  顶层元素总数="+tos(cnt)
-    }
-    _ => {
-        ` "根节点不是数组"
-    }
+# ---- 校验入口：解析整段 JSON，语法错误即 panic，成功返回末尾位置（规范第 21 节） ----
+# 校验与结构共享同一 parse_* 递归下降；构建的 Json AST 在本函数返回时确定性深释放。
+f/validate(s:&str):i64{
+    //v, end = parse_value(s, 0)
+    //n=len(s)
+    check(end==n, "JSON 结尾有多余字符")
+    r/end
 }
-` ""
-` "done"
+
