@@ -83,6 +83,9 @@ pub struct VarInfo {
     pub is_param: bool,
     /// v4.3：是否为动态数组借用形参 &[]T（只读视图，规范 22.8）
     pub is_borrow: bool,
+    /// v4.9：是否为只读容器元素读取赋值来的借用枚举（如 `//y=a[i]`）。
+    /// match 此类借用枚举时只取走 payload、不得释放包装句柄（容器仍持有）。
+    pub borrow_elem: bool,
 }
 
 impl VarInfo {
@@ -93,6 +96,7 @@ impl VarInfo {
             moved: false,
             is_param: false,
             is_borrow: false,
+            borrow_elem: false,
         }
     }
 
@@ -104,6 +108,7 @@ impl VarInfo {
             moved: false,
             is_param: true,
             is_borrow,
+            borrow_elem: false,
         }
     }
 }
@@ -126,6 +131,7 @@ pub fn check(prog: &Program) -> Result<(), CheckError> {
     set_darrs(&prog.darrs);
     set_tuples(&prog.tuples);
     set_maps(&prog.maps);
+    set_enums(&prog.enums);
     // 函数表（定义顺序无关）
     let mut funcs: HashMap<String, FuncSig> = HashMap::new();
     for f in &prog.funcs {
@@ -187,6 +193,46 @@ pub fn check(prog: &Program) -> Result<(), CheckError> {
                         sd.name, f.name
                     ),
                 ));
+            }
+        }
+    }
+
+    // v4.9：枚举声明校验（和类型，规范第 26 节）
+    for ed in &prog.enums {
+        if ed.variants.is_empty() {
+            return Err(err(ed.line, format!("枚举 '{}' 至少需要一个变体", ed.name)));
+        }
+        for v in &ed.variants {
+            if let Some(pt) = v.payload {
+                if pt == Ty::BorrowStr {
+                    return Err(err(
+                        v.line,
+                        format!("枚举 '{}' 变体 '{}' 的 payload 不能是借用 &str（借用不可存储在枚举中）", ed.name, v.name),
+                    ));
+                }
+                if pt.is_arr() {
+                    return Err(err(
+                        v.line,
+                        format!("枚举 '{}' 变体 '{}' 的 payload 不能是固定数组（v4.9 暂不支持）", ed.name, v.name),
+                    ));
+                }
+                if pt.is_tuple() {
+                    return Err(err(
+                        v.line,
+                        format!("枚举 '{}' 变体 '{}' 的 payload 不能是元组（元组仅存在于返回边界）", ed.name, v.name),
+                    ));
+                }
+                // payload 若引用枚举/结构体，须索引有效（darr/map 的元素类型已由类型表保证存在）
+                if let Ty::Struct(i) = pt {
+                    if (i as usize) >= prog.structs.len() {
+                        return Err(err(v.line, format!("枚举 '{}' 变体 '{}' 引用了未定义的结构体", ed.name, v.name)));
+                    }
+                }
+                if let Ty::Enum(i) = pt {
+                    if (i as usize) >= prog.enums.len() {
+                        return Err(err(v.line, format!("枚举 '{}' 变体 '{}' 引用了未定义的枚举", ed.name, v.name)));
+                    }
+                }
             }
         }
     }
@@ -802,6 +848,104 @@ fn check_stmt(
             }
             Ok(())
         }
+        // v4.9：enum 匹配（语句级，穷尽性检查 + `_` 通配；规范第 26 节）
+        Stmt::Match {
+            scrutinee,
+            arms,
+            line,
+        } => {
+            let st = ty_of(scrutinee, scope, funcs, structs)?;
+            let enum_tab = enums();
+            let ed = enum_by_id(&enum_tab, st).ok_or_else(|| {
+                err(
+                    *line,
+                    format!("match 的被匹配值必须是枚举，实际 {}", ty_label(st, structs)),
+                )
+            })?;
+            // 穷尽性：覆盖位图 + 通配
+            let mut covered = vec![false; ed.variants.len()];
+            let mut wildcard = false;
+            for arm in arms {
+                let mut owned_binds = Vec::new();
+                for p in &arm.pats {
+                    match p {
+                        Pat::Wild => wildcard = true,
+                        Pat::Variant { name, bind } => {
+                            let vi = ed.variants.iter().position(|v| &v.name == name).ok_or_else(|| {
+                                err(*line, format!("枚举 '{}' 没有变体 '{}'", ed.name, name))
+                            })?;
+                            let needs_payload = ed.variants[vi].payload.is_some();
+                            let has_bind = bind.is_some();
+                            if needs_payload != has_bind {
+                                return Err(err(
+                                    *line,
+                                    format!(
+                                        "变体 '{}' 的 payload 要求不匹配：{}",
+                                        name,
+                                        if needs_payload {
+                                            "应绑定变量（Variant(x)）"
+                                        } else {
+                                            "不应绑定变量（Variant）"
+                                        }
+                                    ),
+                                ));
+                            }
+                            if let (true, Some(bnm)) = (needs_payload, bind) {
+                                owned_binds.push((bnm.clone(), ed.variants[vi].payload.unwrap()));
+                            }
+                            covered[vi] = true;
+                        }
+                    }
+                }
+                // 臂体：子作用域（scrutinee 消费、绑定注入）
+                let mut child = scope.clone();
+                // 被匹配的枚举若为 owned 变量，标记为已移动（match 消费其所有权）
+                if let Expr::Var(bn) = scrutinee.as_ref() {
+                    if let Some(v) = child.get_mut(bn) {
+                        if is_owned(v.ty) {
+                            v.moved = true;
+                        }
+                    }
+                }
+                for (bnm, bty) in owned_binds {
+                    child.insert(bnm, VarInfo::new(bty, false));
+                }
+                for stmt in &arm.body {
+                    check_stmt(stmt, &mut child, funcs, structs, in_fn, fn_ret, in_loop)?;
+                }
+            }
+            if !wildcard {
+                let missing: Vec<&String> = ed
+                    .variants
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !covered[*i])
+                    .map(|(_, v)| &v.name)
+                    .collect();
+                if !missing.is_empty() {
+                    return Err(err(
+                        *line,
+                        format!(
+                            "match 未穷尽所有变体，缺少：{}（或加 _ 通配）",
+                            missing
+                                .iter()
+                                .map(|n| n.as_str())
+                                .collect::<Vec<_>>()
+                                .join(" / ")
+                        ),
+                    ));
+                }
+            }
+            // 外层标记被匹配变量已移动
+            if let Expr::Var(bn) = scrutinee.as_ref() {
+                if let Some(v) = scope.get_mut(bn) {
+                    if is_owned(v.ty) {
+                        v.moved = true;
+                    }
+                }
+            }
+            Ok(())
+        }
         Stmt::Expr(e, line) => match e {
             Expr::Call { .. } => {
                 check_expr(e, scope, funcs, structs, *line)?;
@@ -1020,7 +1164,32 @@ pub fn norm(t: Ty) -> Ty {
 /// v3.0：受天权所有权约束的堆类型——str 与结构体（规范 11.2 / 14.4）。
 /// 赋值、传参、返回均移动所有权；数值与 bool 为纯值类型，不参与。
 pub fn is_owned(t: Ty) -> bool {
-    t == Ty::Str || t.is_struct() || t.is_darr() || t.is_map()
+    t == Ty::Str || t.is_struct() || t.is_darr() || t.is_map() || t.is_enum()
+}
+
+/// v4.9：判定 value 是否"只读容器元素"读取（如 `[]Json` 的 arr[i]、`map[str]Json` 的 m[k]）。
+/// 这类读取返回的是容器仍持有的句柄——**借用**而非所有权转移，读方不得释放。
+/// 判断依据：最外层是 Index，且基类型（动态数组元素 / map 值）为 owned（str/枚举/容器）。
+pub fn is_owned_elem_read(value: &Expr, scope: &HashMap<String, Ty>, sigs: &HashMap<String, FuncSig>, structs: &[StructDef]) -> bool {
+    match value {
+        Expr::Index(base, _) => {
+            let bt = norm(ty_of(base, scope, sigs, structs).unwrap_or(Ty::I64));
+            if let Ty::DArr(i) = bt {
+                darrs()
+                    .get(i as usize)
+                    .map(|d| is_owned(d.elem))
+                    .unwrap_or(false)
+            } else if let Ty::Map(i) = bt {
+                maps()
+                    .get(i as usize)
+                    .map(|m| is_owned(m.val))
+                    .unwrap_or(false)
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
 }
 
 // ── v3.0 结构体表（代码生成侧共享）──────────────────────────────
@@ -1062,6 +1231,37 @@ pub fn field_ty(sd: &StructDef, fname: &str) -> Option<Ty> {
     sd.fields.iter().find(|f| f.name == fname).map(|f| f.ty)
 }
 
+// ── v4.9 枚举表（代码生成侧共享，机制同 STRUCTS）────────────
+thread_local! {
+    static ENUMS: std::cell::RefCell<Vec<EnumDef>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// 设置当前线程的枚举表（后端入口调用）
+pub fn set_enums(enums: &[EnumDef]) {
+    ENUMS.with(|e| *e.borrow_mut() = enums.to_vec());
+}
+
+/// 读取当前线程的枚举表快照
+pub fn enums() -> Vec<EnumDef> {
+    ENUMS.with(|e| e.borrow().clone())
+}
+
+/// v4.9：按 Ty::Enum 索引取枚举定义
+pub fn enum_by_id<'a>(enums: &'a [EnumDef], t: Ty) -> Option<&'a EnumDef> {
+    match t {
+        Ty::Enum(i) => enums.get(i as usize),
+        _ => None,
+    }
+}
+
+/// v4.9：枚举变体 payload 类型（找不到返回 None）
+pub fn variant_payload<'a>(ed: &'a EnumDef, vname: &str) -> Option<Ty> {
+    ed.variants
+        .iter()
+        .find(|v| v.name == vname)
+        .and_then(|v| v.payload)
+}
+
 /// v3.0：含结构体名的类型标签（报错信息用）
 pub fn ty_label(t: Ty, structs: &[StructDef]) -> String {
     match t {
@@ -1081,6 +1281,10 @@ pub fn ty_label(t: Ty, structs: &[StructDef]) -> String {
             .get(i as usize)
             .map(|m| format!("map[{}]{}", m.key.label(), m.val.label()))
             .unwrap_or_else(|| "map".into()),
+        Ty::Enum(i) => enums()
+            .get(i as usize)
+            .map(|e| e.name.clone())
+            .unwrap_or_else(|| "enum".into()),
         other => other.label().to_string(),
     }
 }
@@ -1320,6 +1524,44 @@ pub fn ty_of<S: TyLookup>(
                 .ok_or_else(|| err(0, "内部错误：map 值类型无对应动态数组"))? as u32;
             Ok(Ty::DArr(darr))
         }
+        // v4.9：枚举构造 Json::Variant(payload) —— 类型即该枚举（规范第 26 节）
+        Expr::EnumCtor { en, variant, payload, .. } => {
+            let enum_tab = enums();
+            let ed = enum_by_id(&enum_tab, Ty::Enum(*en)).ok_or_else(|| {
+                err(0, format!("内部错误：枚举类型索引 {} 越界", en))
+            })?;
+            let vi = ed.variants.iter().position(|v| &v.name == variant).ok_or_else(|| {
+                err(0, format!("内部错误：枚举 '{}' 没有变体 '{}'", ed.name, variant))
+            })?;
+            let declared = ed.variants[vi].payload;
+            let has_payload = payload.is_some();
+            if declared.is_some() != has_payload {
+                return Err(err(
+                    0,
+                    format!(
+                        "枚举 '{}' 变体 '{}' 的构造 payload 缺失/多余",
+                        ed.name, variant
+                    ),
+                ));
+            }
+            // v4.9：校验 payload 的类型与变体声明一致（含字面量 I32 收窄特判）
+            if let (Some(p_expr), Some(p_ty)) = (payload, declared) {
+                let pt = norm(ty_of(p_expr, scope, funcs, structs)?);
+                if !value_assignable(p_ty, pt, p_expr) {
+                    return Err(err(
+                        0,
+                        format!(
+                            "枚举 '{}' 变体 '{}' 的 payload 需要 {}，实际 {}",
+                            ed.name,
+                            variant,
+                            ty_label(p_ty, structs),
+                            ty_label(pt, structs)
+                        ),
+                    ));
+                }
+            }
+            Ok(Ty::Enum(*en))
+        }
         // v3.7：sel(cond, a, b) —— 仅数值/bool 分支；类型按提升规则统一（规范第 18 节）
         Expr::Sel { cond, a, b } => {
             let ct = norm(ty_of(cond, scope, funcs, structs)?);
@@ -1462,7 +1704,8 @@ pub fn collect_str_decls(
                 let t = (*ty)
                     .unwrap_or_else(|| ty_of(value, scope, sigs, structs).unwrap_or(Ty::I64));
                 scope.insert(name.clone(), t);
-                if is_owned(t) && !out.contains(name) {
+                // v4.9：只读容器元素读取是借用（容器持有、读方不释放），不入堆槽/出口释放清单
+                if !is_owned_elem_read(value, scope, sigs, structs) && is_owned(t) && !out.contains(name) {
                     out.push(name.clone());
                 }
             }
@@ -1488,6 +1731,34 @@ pub fn collect_str_decls(
                 collect_str_decls(body, scope, sigs, structs, out);
                 if let Some(eb) = else_body {
                     collect_str_decls(eb, scope, sigs, structs, out);
+                }
+            }
+            // v4.9：match 臂体内的 owned 变量声明——须递归收集并在外层 NULL 提升，
+            // 否则臂内/循环内重绑定枚举等 owned 槽无 `= NULL` 声明导致编译失败
+            Stmt::Match { scrutinee, arms, .. } => {
+                let en = match norm(ty_of(scrutinee, scope, sigs, structs).unwrap_or(Ty::I64)) {
+                    Ty::Enum(i) => i as usize,
+                    _ => {
+                        // scrutinee 类型未知时仍尽力递归（借用/移动逻辑由 type_check 主流程保证）
+                        for arm in arms {
+                            collect_str_decls(&arm.body, scope, sigs, structs, out);
+                        }
+                        continue;
+                    }
+                };
+                for arm in arms {
+                    // 注入每臂模式绑定的 payload 类型，使臂体内 ty_of 解析正确
+                    for p in &arm.pats {
+                        if let Pat::Variant { name, bind: Some(b) } = p {
+                            if let Some(pt) = variant_payload(&enums()[en], name) {
+                                scope.insert(b.clone(), pt);
+                                if is_owned(pt) && !out.contains(b) {
+                                    out.push(b.clone());
+                                }
+                            }
+                        }
+                    }
+                    collect_str_decls(&arm.body, scope, sigs, structs, out);
                 }
             }
             _ => {}
@@ -1521,6 +1792,11 @@ pub fn consumes_var(
             .unwrap_or(false),
         // copy()/tos() 参数只借用（规范 11.2.4）
         Expr::Convert { arg, .. } => consumes_var(arg, name, false, sigs),
+        // v4.9：枚举构造的 payload 若为 owned 变量则被接管（规范第 26 节）
+        Expr::EnumCtor { payload, .. } => payload
+            .as_ref()
+            .map(|p| consumes_var(p, name, true, sigs))
+            .unwrap_or(false),
         _ => false,
     }
 }
@@ -2135,6 +2411,40 @@ fn check_expr(
                 check(e, scope)?;
             }
             Ok(Ty::Tuple(*tup))
+        }
+        // v4.9：枚举构造 Json::Variant(payload)（规范第 26 节）
+        Expr::EnumCtor { en, variant, payload, .. } => {
+            let enum_tab = enums();
+            let ed = enum_by_id(&enum_tab, Ty::Enum(*en)).ok_or_else(|| {
+                err(line, "内部错误：枚举类型索引越界")
+            })?;
+            let vi = ed.variants.iter().position(|v| &v.name == variant).ok_or_else(|| {
+                err(line, format!("内部错误：枚举 '{}' 没有变体 '{}'", ed.name, variant))
+            })?;
+            let declared = ed.variants[vi].payload;
+            let has_payload = payload.is_some();
+            if declared.is_some() != has_payload {
+                return Err(err(
+                    line,
+                    format!("枚举 '{}' 变体 '{}' 的构造 payload 缺失/多余", ed.name, variant),
+                ));
+            }
+            if let (Some(p_expr), Some(p_ty)) = (payload, declared) {
+                let pt = norm(check(p_expr, scope)?);
+                if !value_assignable(p_ty, pt, p_expr) {
+                    return Err(err(
+                        line,
+                        format!(
+                            "枚举 '{}' 变体 '{}' 的 payload 需要 {}，实际 {}",
+                            ed.name,
+                            variant,
+                            ty_label(p_ty, structs),
+                            ty_label(pt, structs)
+                        ),
+                    ));
+                }
+            }
+            Ok(Ty::Enum(*en))
         }
         Expr::Convert { name, arg } => {
             if name == "copy" {

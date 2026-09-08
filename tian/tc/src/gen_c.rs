@@ -76,7 +76,11 @@ fn free_slot(var_c: &str, t: Ty) -> String {
         // v4.2：str 动态数组逐元素深释放（规范 22.6）
         Ty::DArr(i) => {
             let d = crate::type_check::darrs()[i as usize].clone();
-            if d.elem == Ty::Str {
+            // v4.9：枚举元素按回调深释放（对齐原生后端；规范第 26 节）
+            if let Ty::Enum(ei) = d.elem {
+                let ed = crate::type_check::enums()[ei as usize].clone();
+                format!("__t_dfree_e({}, {});", var_c, enum_free_fn(&ed))
+            } else if d.elem == Ty::Str {
                 format!("__t_dfree_s({});", var_c)
             } else {
                 format!("__t_free({});", var_c)
@@ -87,6 +91,11 @@ fn free_slot(var_c: &str, t: Ty) -> String {
             let m = crate::type_check::maps()[i as usize].clone();
             format!("__t_mfree_{}({});", map_wire(&m), var_c)
         }
+        // v4.9：枚举整体深释放（NULL 安全，递归 payload 一并释放；规范第 26 节）
+        Ty::Enum(i) => {
+            let ed = crate::type_check::enums()[i as usize].clone();
+            format!("{}({});", enum_free_fn(&ed), var_c)
+        }
         _ => format!("__t_free({});", var_c),
     }
 }
@@ -96,9 +105,90 @@ fn free_fn(sd: &StructDef) -> String {
     format!("__t_free_{}", cname(&sd.name))
 }
 
+/// v4.9：判断 value 是否"只读容器元素读取"（如 `[]Json` 的 arr[i]、`map[str]Json` 的 m[k]）。
+/// 读方为借用（容器持有句柄），不释放——避免双重释放（见 Stmt::Decl 分支）。
+fn is_borrow_elem_read(value: &Expr, scope: &Scope, sigs: &HashMap<String, FuncSig>) -> bool {
+    match value {
+        Expr::Index(base, _) => {
+            let bt = norm(ty_of(base, scope, sigs, &structs()).unwrap_or(Ty::I64));
+            match bt {
+                Ty::DArr(i) => crate::type_check::darrs()
+                    .get(i as usize)
+                    .map(|d| is_owned(d.elem))
+                    .unwrap_or(false),
+                Ty::Map(i) => crate::type_check::maps()
+                    .get(i as usize)
+                    .map(|m| is_owned(m.val))
+                    .unwrap_or(false),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 /// v3.0：结构体构造函数名
 fn new_fn(sd: &StructDef) -> String {
     format!("__t_new_{}", cname(&sd.name))
+}
+
+/// v4.9：枚举深释放函数名（∈ 递归 self/cross 引用；用于 free_slot 与 match `_` 臂）
+fn enum_free_fn(ed: &EnumDef) -> String {
+    format!("__t_free_e_{}", cname(&ed.name))
+}
+
+/// v4.9：枚举深释放函数体内的行。case tag 对应变体：str / []Enum / map[str]Enum / 其他枚举 / struct 需持有；
+/// 标量（i32/i64/f64/bool）与空 payload 变体无持有。
+/// e 为 void*（即 __t_enum_val*），x 为已 cast 的局部变量名。
+fn enum_case_free(pt: Ty) -> String {
+    match pt {
+        Ty::Str => "__t_free((char*)x->p);".to_string(),
+        Ty::I32 | Ty::I64 | Ty::F64 | Ty::Bool => String::new(),
+        // 唯一样例：enum 含递归容器 payload（Arr([]Json) / Obj(map[str]Json)）
+        Ty::DArr(i) => {
+            let d = crate::type_check::darrs()[i as usize].clone();
+            match d.elem {
+                Ty::Enum(ei) => {
+                    let ed = crate::type_check::enums()[ei as usize].clone();
+                    format!("__t_dfree_e((void*)x->p, {free});", free = enum_free_fn(&ed))
+                }
+                _ => String::new(),
+            }
+        }
+        Ty::Map(i) => {
+            let m = crate::type_check::maps()[i as usize].clone();
+            match (m.key, m.val) {
+                (Ty::Str, Ty::Enum(ei)) => {
+                    let ed = crate::type_check::enums()[ei as usize].clone();
+                    format!("__t_mfree_se((void*)x->p, {free});", free = enum_free_fn(&ed))
+                }
+                _ => String::new(),
+            }
+        }
+        // 其他枚举 / struct / 定长数组 / 元组：本轮声明校验已拦截（递归只经容器），防御性为空
+        _ => String::new(),
+    }
+}
+
+/// v4.9：按 Ty::Enum 索引取枚举定义（C 后端 match 分派使用）
+fn enum_by_ty(t: Ty) -> Option<EnumDef> {
+    match t {
+        Ty::Enum(i) => Some(crate::type_check::enums()[i as usize].clone()),
+        _ => None,
+    }
+}
+
+/// v4.9：从枚举包装 __t_e 中读取 payload 槽（`__t_e` 是 void* 即 __t_enum_val*）。
+/// 标量按位模式读回；f64 经 eunpack；str/容器/枚举/struct 读回 8 字节句柄。
+fn payload_read_expr(pt: Ty, e: &str) -> String {
+    match pt {
+        Ty::I32 => format!("(int)(((__t_enum_val*){})->p)", e),
+        Ty::I64 => format!("(long long)(((__t_enum_val*){})->p)", e),
+        Ty::Bool => format!("(int)(((__t_enum_val*){})->p)", e),
+        Ty::F64 => format!("__t_eunpack((((__t_enum_val*){})->p))", e),
+        Ty::Str => format!("(char*)(((__t_enum_val*){})->p)", e),
+        _ => format!("(void*)(((__t_enum_val*){})->p)", e),
+    }
 }
 
 /// v4.7：map 字面量构造代码块（规范第 25 节）。
@@ -163,6 +253,7 @@ pub fn generate(prog: &Program) -> String {
     crate::type_check::set_darrs(&prog.darrs);
     crate::type_check::set_tuples(&prog.tuples);
     crate::type_check::set_maps(&prog.maps);
+    crate::type_check::set_enums(&prog.enums);
 
     // 头部与运行时辅助函数
     out.push_str("/* 由 tc（Tian Compiler v2.0，天权）生成 */\n");
@@ -195,12 +286,22 @@ pub fn generate(prog: &Program) -> String {
          static long long __t_sget(const char* s, long long i){ long long n=(long long)strlen(s); if(i<0||i>=n) __t_panic(\"字符串下标越界\"); return (long long)(unsigned char)s[i]; }\n\
          static void* __t_dpush_s(void* h, char* v){ __t_darr_hdr* x=(__t_darr_hdr*)h; if(x->len==x->cap) h=__t_dgrow(h); ((char**)__t_darr_data(h))[((__t_darr_hdr*)h)->len]=v; ((__t_darr_hdr*)h)->len++; return h; }\n\
          static char* __t_dget_s(void* h, long long i){ __t_dbound(h,i); return ((char**)__t_darr_data(h))[i]; }\n\
+         static void* __t_dpush_e(void* h, void* v){ __t_darr_hdr* x=(__t_darr_hdr*)h; if(x->len==x->cap) h=__t_dgrow(h); ((void**)__t_darr_data(h))[((__t_darr_hdr*)h)->len]=v; ((__t_darr_hdr*)h)->len++; return h; }\n\
+         static void* __t_dget_e(void* h, long long i){ __t_dbound(h,i); return ((void**)__t_darr_data(h))[i]; }\n\
          static void __t_dfree_s(void* h){ __t_darr_hdr* x=(__t_darr_hdr*)h; for(long long i=0;i<x->len;i++) free(((char**)__t_darr_data(h))[i]); free(h); }\n\
          static double __t_tof(const char* s){ char* end=0; double v=strtod(s,&end); if(end==s||*end!=0) __t_panic(\"无效数字\"); return v; }\n\
          static char* __t_sub(const char* s, long long start, long long n){ long long len=(long long)strlen(s); if(start<0||n<0||start+n>len) __t_panic(\"子串越界\"); char* r=(char*)malloc((size_t)n+1); if(!r){fprintf(stderr,\"天运行时：内存分配失败\\n\");exit(1);} memcpy(r,s+start,(size_t)n); r[n]=0; return r; }\n\
          static int __t_idiv_i(int a, int b){ if(b==0) __t_panic(\"除数为零\"); return a/b; }\n\
          static long long __t_idiv_l(long long a, long long b){ if(b==0) __t_panic(\"除数为零\"); return a/b; }\n\
          static void* __t_malloc(long long size){ void* p=malloc((size_t)size); if(!p){fprintf(stderr,\"天运行时：内存分配失败\\n\");exit(1);} return p; }\n\
+         // v4.9 枚举 payload 槽：f64 ↔ 位模式（枚举统一 long long 8 字节槽）\n\
+         static long long __t_epack(double v){ long long b; memcpy(&b,&v,8); return b; }\n\
+         static double __t_eunpack(long long b){ double d; memcpy(&d,&b,8); return d; }\n\
+         // v4.9 枚举值堆块：{tag, p} 各 8 字节（tag=变体下标，p=payload 槽；间接存储满足递归类型）\n\
+         typedef struct { long long tag, p; } __t_enum_val;\n\
+         static void* __t_enum_new(long long tag, long long p){ __t_enum_val* e=(__t_enum_val*)__t_malloc(16); e->tag=tag; e->p=p; return e; }\n\
+         static long long __t_enum_tag(void* e){ return ((__t_enum_val*)e)->tag; }\n\
+         static void* __t_enum_wrap(void* e){ __t_free(e); return e; }\n\
          typedef struct __t_mnode{ long long hash; struct __t_mnode* next; long long key; long long val; } __t_mnode;\n\
          typedef struct { long long len, cap; } __t_map_hdr;\n\
          static __t_mnode** __t_mbuckets(void* h){ return (__t_mnode**)((char*)h + 16); }\n\
@@ -246,7 +347,11 @@ pub fn generate(prog: &Program) -> String {
          static void __t_mfree_is(void* h){ if(!h)return; __t_map_hdr* x=(__t_map_hdr*)h; for(long long i=0;i<x->cap;i++){ __t_mnode* n=__t_mbuckets(h)[i]; while(n){ __t_mnode* nx=n->next; free((void*)n->val); free(n); n=nx; } } free(h); }\n\
          static void __t_mfree_si(void* h){ if(!h)return; __t_map_hdr* x=(__t_map_hdr*)h; for(long long i=0;i<x->cap;i++){ __t_mnode* n=__t_mbuckets(h)[i]; while(n){ __t_mnode* nx=n->next; free((void*)n->key); free(n); n=nx; } } free(h); }\n\
          static void __t_mfree_sf(void* h){ __t_mfree_si(h); }\n\
-         static void __t_mfree_ss(void* h){ if(!h)return; __t_map_hdr* x=(__t_map_hdr*)h; for(long long i=0;i<x->cap;i++){ __t_mnode* n=__t_mbuckets(h)[i]; while(n){ __t_mnode* nx=n->next; free((void*)n->key); free((void*)n->val); free(n); n=nx; } } free(h); }\n\n",
+         static void __t_mfree_ss(void* h){ if(!h)return; __t_map_hdr* x=(__t_map_hdr*)h; for(long long i=0;i<x->cap;i++){ __t_mnode* n=__t_mbuckets(h)[i]; while(n){ __t_mnode* nx=n->next; free((void*)n->key); free((void*)n->val); free(n); n=nx; } } free(h); }\n\
+         // v4.9 枚举：[]Enum 动态数组逐元素回调深释放（元素是 void* 句柄）\n\
+         static void __t_dfree_e(void* h, void(*fr)(void*)){ if(!h)return; __t_darr_hdr* x=(__t_darr_hdr*)h; long long* b=(long long*)__t_darr_data(h); for(long long i=0;i<x->len;i++) if(b[i]) fr((void*)b[i]); free(h); }\n\
+         // v4.9 枚举：map[str]Enum 键 str + 值逐元素回调深释放\n\
+         static void __t_mfree_se(void* h, void(*fr)(void*)){ if(!h)return; __t_map_hdr* x=(__t_map_hdr*)h; for(long long i=0;i<x->cap;i++){ __t_mnode* n=__t_mbuckets(h)[i]; while(n){ __t_mnode* nx=n->next; free((void*)n->key); if(n->val) fr((void*)n->val); free(n); n=nx; } } free(h); }\n\n",
     );
 
     // v3.0：结构体类型定义 + 构造函数 + 深释放（规范第 14 节）
@@ -294,6 +399,39 @@ pub fn generate(prog: &Program) -> String {
             S = cname(&sd.name),
             body = free_body
         );
+    }
+
+    // v4.9：枚举深释放函数（递归容器用回调清理；先声明所有函数再定义，兼容跨枚举/自引用）
+    // 枚举值 = void* 堆句柄（__t_enum_val*，见运行时 {tag, p}）——递归类型经 16 字节堆块间接存储。
+    // 每个枚举一个 static void __t_free_e_{Name}(void* e)：switch(tag) 分派变体释放 payload 槽。
+    if !prog.enums.is_empty() {
+        // 前向声明（顺序无关，避免自/互递归的前置定义问题）
+        for ed in &prog.enums {
+            let _ = writeln!(
+                out,
+                "static void {free}(void* e);",
+                free = enum_free_fn(ed)
+            );
+        }
+        for ed in &prog.enums {
+            let mut body = String::new();
+            for (i, v) in ed.variants.iter().enumerate() {
+                let line = v.payload.map(enum_case_free).unwrap_or_default();
+                if line.is_empty() {
+                    body.push_str(&format!("        case {i}:\n            break;\n"));
+                } else {
+                    body.push_str(&format!("        case {i}:\n            {line}\n            break;\n"));
+                }
+            }
+            // default：未知 tag（不应发生，防御性仅释放包装块，避免泄漏 payload）
+            body.push_str("        default:\n            break;\n");
+            let _ = writeln!(
+                out,
+                "static void {free}(void* e) {{ if (!e) return; __t_enum_val* x = (__t_enum_val*)e;\n    switch (x->tag) {{\n{body}    }}\n    __t_free(e); }}\n",
+                free = enum_free_fn(ed),
+                body = body,
+            );
+        }
     }
 
     // 函数表（供 ty_of 校验函数调用表达式）
@@ -501,7 +639,7 @@ pub fn generate(prog: &Program) -> String {
             Ty::Struct(_) => "NULL",
             Ty::BorrowStr => unreachable!("借用不可作为返回类型（检查器已拦截）"),
             Ty::Arr(_) => unreachable!("定长数组不可作为返回类型（检查器已拦截）"),
-            Ty::DArr(_) | Ty::Tuple(_) | Ty::Map(_) => "NULL",
+            Ty::DArr(_) | Ty::Tuple(_) | Ty::Map(_) | Ty::Enum(_) => "NULL",
         };
         match &post {
             Some((pexpr, cline)) => {
@@ -596,6 +734,12 @@ fn emit_move_nulls(
                 emit_move_nulls(e, true, scope, sigs, out, level);
             }
         }
+        // v4.9：枚举构造的 payload 若为 owned 变量（str/容器/枚举），被构造接管而抛弃原槽 → 置空
+        Expr::EnumCtor { payload, .. } => {
+            if let Some(p) = payload {
+                emit_move_nulls(p, true, scope, sigs, out, level);
+            }
+        }
         _ => {}
     }
 }
@@ -625,6 +769,10 @@ fn has_move_nulls(e: &Expr, is_top: bool, sigs: &HashMap<String, FuncSig>) -> bo
         Expr::DArrLit { elems, .. } => elems.iter().any(|e| has_move_nulls(e, true, sigs)),
         Expr::Sub { s, .. } => has_move_nulls(s, false, sigs),
         Expr::TupExpr { elems, .. } => elems.iter().any(|e| has_move_nulls(e, true, sigs)),
+        Expr::EnumCtor { payload, .. } => payload
+            .as_ref()
+            .map(|p| has_move_nulls(p, true, sigs))
+            .unwrap_or(false),
         _ => false,
     }
 }
@@ -737,6 +885,8 @@ fn emit_stmt(
                                 "__t_dpush_f"
                             } else if de.elem == Ty::Str {
                                 "__t_dpush_s"
+                            } else if de.elem.is_enum() {
+                                "__t_dpush_e"
                             } else {
                                 "__t_dpush_i"
                             };
@@ -792,6 +942,16 @@ fn emit_stmt(
             }
             indent(out, level);
             let cn = cname(name);
+            // v4.9：只读容器元素读取（如 `[]Json` 的 arr[i]）——借用：块内全新槽、
+            // 不释放旧值、不入深释清单（符号名仍注册供读取）。避免与容器深释双重释放。
+            if is_owned(t) && is_borrow_elem_read(value, scope, sigs) {
+                let _ = writeln!(out, "void* {} = {};", cn, e);
+                if let Some(vi) = scope.get_mut(name) {
+                    vi.borrow_elem = true;
+                }
+                let _ = mutable;
+                return;
+            }
             if is_owned(t) {
                 // 槽已提升为 NULL 初始化；先深释放旧值（首次声明释放 NULL 安全），
                 // 再接管移动来的值的指针
@@ -970,6 +1130,8 @@ fn emit_stmt(
                                 "__t_dpush_f"
                             } else if de.elem == Ty::Str {
                                 "__t_dpush_s"
+                            } else if de.elem.is_enum() {
+                                "__t_dpush_e"
                             } else {
                                 "__t_dpush_i"
                             };
@@ -1088,6 +1250,7 @@ fn emit_stmt(
                 Ty::Arr(_) => unreachable!("Print 类型已归一化（数组不可直接打印，检查器已拦截）"),
                 Ty::DArr(_) | Ty::Tuple(_) => unreachable!("Print 类型已归一化（不可直接打印，检查器已拦截）"),
                 Ty::Map(_) => unreachable!("Print 类型已归一化（map 不可直接打印，检查器已拦截）"),
+                Ty::Enum(_) => unreachable!("Print 类型已归一化（枚举不可直接打印，检查器已拦截）"),
             };
             let cast = match t {
                 Ty::I32 | Ty::I64 => "(long long)",
@@ -1101,6 +1264,7 @@ fn emit_stmt(
                 Ty::DArr(_) => unreachable!("Print 类型已归一化（数组不可直接打印，检查器已拦截）"),
                 Ty::Tuple(_) => unreachable!("Print 类型已归一化（元组不可直接打印，检查器已拦截）"),
                 Ty::Map(_) => unreachable!("Print 类型已归一化（map 不可直接打印，检查器已拦截）"),
+                Ty::Enum(_) => unreachable!("Print 类型已归一化（枚举不可直接打印，检查器已拦截）"),
             };
             let val = if t == Ty::Bool {
                 format!("__t_tos_b((int)({}))", x)
@@ -1228,6 +1392,7 @@ fn emit_stmt(
             Ty::DArr(_) => unreachable!("动态数组必走 owned 返回分支（检查器已拦截）"),
             Ty::Tuple(_) => unreachable!("元组必走 owned 返回分支（检查器已拦截）"),
             Ty::Map(_) => unreachable!("map 必走 owned 返回分支（检查器已拦截）"),
+            Ty::Enum(_) => unreachable!("枚举必走 owned 返回分支（检查器已拦截）"),
                         };
                         let _ = writeln!(out, "return {}({});", cast, x);
                     }
@@ -1240,7 +1405,7 @@ fn emit_stmt(
                         Ty::Str => "__t_dup(\"\")",
                         Ty::Bool => "0",
                         Ty::Struct(_) => "NULL",
-                        Ty::DArr(_) | Ty::Map(_) => "NULL",
+                        Ty::DArr(_) | Ty::Map(_) | Ty::Enum(_) => "NULL",
                         Ty::BorrowStr => unreachable!("借用不可作为返回类型（检查器已拦截）"),
             Ty::Arr(_) => unreachable!("数组不可作为返回类型（检查器已拦截）"),
             Ty::Tuple(_) => unreachable!("元组返回不可省略值（检查器已拦截）"),
@@ -1297,6 +1462,9 @@ fn emit_stmt(
                     "const char*"
                 } else if td.elems[i] == Ty::F64 {
                     "double"
+                } else if td.elems[i].is_enum() {
+                    // v4.9：枚举元素为 void* 句柄，8 字节槽读回指针
+                    "void*"
                 } else {
                     "long long"
                 };
@@ -1365,6 +1533,8 @@ fn emit_stmt(
                 "__t_dpush_f"
             } else if de.elem == Ty::Str {
                 "__t_dpush_s"
+            } else if de.elem.is_enum() {
+                "__t_dpush_e"
             } else {
                 "__t_dpush_i"
             };
@@ -1426,6 +1596,95 @@ fn emit_stmt(
             indent(out, level);
             let _ = writeln!(out, "if (!({})) {{ __t_panic({}); }}", c, m);
         }
+        // v4.9：match —— 语句级穷尽分派（规范第 26 节）。
+        // 枚举值进临时句柄 __t_e；switch(tag) 逐变体分派：
+        //   owned payload 绑定前先转移（p 置 0），臂体用绑定变量，尾部自由深释放，随后 __t_free(wrapper)；
+        //   `_` 臂对 __t_e 整体深释放再执行臂体。被匹配的 owned 变量先置空（消费所有权）。
+        Stmt::Match { scrutinee, arms, line } => {
+            let _ = line;
+            let st = norm(ty_of(scrutinee, scope, sigs, &structs()).unwrap_or(Ty::I64));
+            let ed = enum_by_ty(st).expect("match 的被匹配值应为枚举（检查器已拦截）");
+            // v4.9：借用枚举（只读容器元素读取）——包装句柄仍归容器，match 只取走 payload，不释放包装
+            let borrowed = match scrutinee.as_ref() {
+                Expr::Var(n) => scope.get(n).map(|vi| vi.borrow_elem).unwrap_or(false),
+                other => is_borrow_elem_read(other, scope, sigs),
+            };
+            let mut es = String::new();
+            emit_expr(scrutinee, scope, sigs, &mut es);
+            indent(out, level);
+            let _ = writeln!(out, "{{ void* __t_e = {};", es);
+            emit_move_nulls(scrutinee, true, scope, sigs, out, level + 1);
+            indent(out, level + 1);
+            let _ = writeln!(out, "switch (__t_enum_tag(__t_e)) {{");
+            for arm in arms {
+                for pat in &arm.pats {
+                    match pat {
+                        Pat::Variant { name, bind } => {
+                            let vi = ed
+                                .variants
+                                .iter()
+                                .position(|v| v.name == *name)
+                                .expect("枚举变体不存在（检查器已拦截）");
+                            let pt = ed.variants[vi].payload;
+                            indent(out, level + 2);
+                            let _ = writeln!(out, "case {vi}: {{");
+                            // 臂内绑定（payload 变量）进入子 scope，供 ty_of/emit_expr 解析类型
+                            let mut child = scope.clone();
+                            if let (Some(bnm), Some(pt)) = (bind, pt) {
+                                child.insert(bnm.clone(), VarInfo::new(pt, false));
+                                let cn = cname(bnm);
+                                let read = payload_read_expr(pt, "__t_e");
+                                indent(out, level + 3);
+                                let _ = writeln!(out, "{} {} = {};", c_ty(pt), cn, read);
+                                // owned payload：所有权转移给绑定变量 → 清空包装槽 p，wrapper 释放不误伤
+                                if is_owned(pt) {
+                                    indent(out, level + 3);
+                                    let _ = writeln!(
+                                        out,
+                                        "((__t_enum_val*)__t_e)->p = 0;"
+                                    );
+                                }
+                            }
+                            for s in &arm.body {
+                                emit_stmt(s, &mut child, sigs, fn_ret, post, out, level + 3);
+                            }
+                            // 绑定变量为 owned payload → 臂体正常结束后深释放其值（避免泄漏）
+                            if let (Some(bnm), Some(pt)) = (bind, pt) {
+                                if is_owned(pt) {
+                                    indent(out, level + 3);
+                                    let _ = writeln!(out, "{}", free_slot(&cname(bnm), pt));
+                                }
+                            }
+                            if !borrowed {
+                                indent(out, level + 3);
+                                let _ = writeln!(out, "__t_free(__t_e);");
+                            }
+                            indent(out, level + 2);
+                            let _ = writeln!(out, "}} break;");
+                        }
+                        Pat::Wild => {
+                            indent(out, level + 2);
+                            let _ = writeln!(out, "default: {{");
+                            for s in &arm.body {
+                                emit_stmt(s, scope, sigs, fn_ret, post, out, level + 3);
+                            }
+                            // `_` 臂：对已消费的枚举整体深释放（覆盖所有未匹配变体）。
+                            // 借用枚举跳过释放——包装仍归容器（实现方以深释放容器元素统一回收）
+                            if !borrowed {
+                                indent(out, level + 3);
+                                let _ = writeln!(out, "{}", free_slot("__t_e", st));
+                            }
+                            indent(out, level + 2);
+                            let _ = writeln!(out, "}} break;");
+                        }
+                    }
+                }
+            }
+            indent(out, level + 1);
+            let _ = writeln!(out, "}}");
+            indent(out, level);
+            let _ = writeln!(out, "}}");
+        }
     }
 }
 
@@ -1469,6 +1728,8 @@ fn emit_expr(e: &Expr, scope: &Scope, sigs: &HashMap<String, FuncSig>, out: &mut
                     "__t_dget_f"
                 } else if de.elem == Ty::Str {
                     "__t_dget_s"
+                } else if de.elem.is_enum() {
+                    "__t_dget_e"
                 } else {
                     "__t_dget_i"
                 };
@@ -1646,7 +1907,44 @@ fn emit_expr(e: &Expr, scope: &Scope, sigs: &HashMap<String, FuncSig>, out: &mut
             }
             out.push_str(&format!("{}({})", new_fn(&sd), args.join(", ")));
         }
-        // v3.0：字段读取 p.x —— base 是结构体指针，用 -> 取成员；
+        // v4.9：枚举构造 Json::Var / Json::Var(payload) —— 堆块 {tag, p}，payload 按变体类型入槽（规范第 26 节）。
+        // 标量入位模式；f64 epack；str 经 emit_bind（字面量 dup / 变量移动）；容器/枚举/struct 移动进槽。
+        Expr::EnumCtor { en, variant, payload, .. } => {
+            let ed = crate::type_check::enums()[*en as usize].clone();
+            let vi = ed
+                .variants
+                .iter()
+                .position(|v| &v.name == variant)
+                .expect("枚举变体不存在（检查器已拦截）");
+            let declared = ed.variants[vi].payload;
+            let mut p_arg = String::from("0");
+            if let (Some(pt), Some(payload)) = (declared, payload) {
+                match pt {
+                    Ty::I32 | Ty::I64 | Ty::Bool => {
+                        let mut s = String::new();
+                        emit_expr(payload, scope, sigs, &mut s);
+                        p_arg = format!("(long long)({})", s);
+                    }
+                    Ty::F64 => {
+                        let mut s = String::new();
+                        emit_expr(payload, scope, sigs, &mut s);
+                        p_arg = format!("__t_epack((double)({}))", s);
+                    }
+                    Ty::Str => {
+                        let mut s = String::new();
+                        emit_bind(payload, scope, sigs, &mut s);
+                        p_arg = format!("(long long)({})", s);
+                    }
+                    // []Enum / map[str]Enum / 其他枚举 / struct：移动 8 字节句柄入槽
+                    _ => {
+                        let mut s = String::new();
+                        emit_expr(payload, scope, sigs, &mut s);
+                        p_arg = format!("(long long)({})", s);
+                    }
+                }
+            }
+            out.push_str(&format!("__t_enum_new({}, {})", vi, p_arg));
+        }
         // str 字段返回其指针（只读借用，不复制，规范 14.3）
         Expr::Field(base, fname) => {
             let bt = norm(ty_of(base, scope, sigs, &structs()).unwrap_or(Ty::I64));

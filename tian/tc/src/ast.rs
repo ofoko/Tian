@@ -25,6 +25,9 @@ pub enum Ty {
     /// v4.7 关联数组：索引 Program.maps（规范第 25 节）。
     /// 哈希表；键 K ∈ {i64,str}，值 V ∈ {i32,i64,f64,bool,str}；堆类型（参与天权）。
     Map(u32),
+    /// v4.9 枚举：索引 Program.enums（规范第 26 节）。
+    /// 和类型；值 = 8 字节堆句柄 void*（tag + payload 间接存储，递归类型必需）；堆类型（参与天权）。
+    Enum(u32),
 }
 
 impl Ty {
@@ -41,6 +44,7 @@ impl Ty {
             Ty::DArr(_) => "void*",
             Ty::Tuple(_) => "void*",
             Ty::Map(_) => "void*",
+            Ty::Enum(_) => "void*",
         }
     }
 
@@ -58,6 +62,7 @@ impl Ty {
             Ty::DArr(_) => "darr",
             Ty::Tuple(_) => "tuple",
             Ty::Map(_) => "map",
+            Ty::Enum(_) => "enum",
         }
     }
 
@@ -88,6 +93,11 @@ impl Ty {
     /// v4.7：关联数组类型（堆类型，规范第 25 节）
     pub fn is_map(&self) -> bool {
         matches!(self, Ty::Map(_))
+    }
+
+    /// v4.9：枚举类型（堆类型，规范第 26 节）
+    pub fn is_enum(&self) -> bool {
+        matches!(self, Ty::Enum(_))
     }
 }
 
@@ -133,6 +143,39 @@ pub struct StructDef {
     pub line: usize,
     /// v3.9：来自 use 导入的文件（fmt 跳过，由其所在模块文件自含）
     pub imported: bool,
+}
+
+/// v4.9 枚举变体：空 payload（Null）或单 payload（Bool(bool)）（规范第 26 节）
+#[derive(Debug, Clone)]
+pub struct VariantDef {
+    pub name: String,
+    /// None = 空 payload；Some = 单 payload 变体
+    pub payload: Option<Ty>,
+    pub line: usize,
+}
+
+/// v4.9 枚举定义：和类型（tag 序号 = variants 下标；payload 槽复用 8 字节槽）
+#[derive(Debug, Clone)]
+pub struct EnumDef {
+    pub name: String,
+    pub variants: Vec<VariantDef>,
+    pub line: usize,
+    /// v3.9：来自 use 导入的文件（fmt 跳过）
+    pub imported: bool,
+}
+
+/// v4.9 匹配模式（规范第 26 节）：`_` 通配 / `Null`（空 payload） / `Bool(b)`（绑定 payload）
+#[derive(Debug, Clone)]
+pub enum Pat {
+    Wild,
+    Variant { name: String, bind: Option<String> },
+}
+
+/// v4.9 匹配臂：一臂可含多个模式（共享同一臂体），如 `Null | Bool(_) => ...`
+#[derive(Debug, Clone)]
+pub struct MatchArm {
+    pub pats: Vec<Pat>,
+    pub body: Vec<Stmt>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,6 +285,14 @@ pub enum Expr {
         a: Box<Expr>,
         b: Box<Expr>,
     },
+    /// v4.9 枚举构造：Json::Str(s) / Json::Null / Json::Bool(b)（规范第 26 节）
+    /// en = Program.enums 索引；None payload = 空变体
+    EnumCtor {
+        en: u32,
+        variant: String,
+        payload: Option<Box<Expr>>,
+        line: usize,
+    },
 }
 
 /// 语句（line 用于报错定位）
@@ -291,6 +342,12 @@ pub enum Stmt {
     Panic(Box<Expr>, usize),
     /// v4.0 check(cond, msg)：断言失败即 panic（规范第 21 节）
     Check(Box<Expr>, Box<Expr>, usize),
+    /// v4.9 枚举匹配（语句级，穷尽性检查 + `_` 通配；规范第 26 节）
+    Match {
+        scrutinee: Box<Expr>,
+        arms: Vec<MatchArm>,
+        line: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -339,6 +396,8 @@ pub struct Program {
     pub tuples: Vec<TupleDef>,
     /// v4.7 关联数组类型表（顺序即 Ty::Map 的索引）
     pub maps: Vec<MapDef>,
+    /// v4.9 枚举类型表（顺序即 Ty::Enum 的索引）
+    pub enums: Vec<EnumDef>,
     /// v3.6 use 导入的模块名（按出现顺序，供 fmt 重建源码）
     pub uses: Vec<String>,
     pub funcs: Vec<FnDef>,

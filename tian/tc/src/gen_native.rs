@@ -4,7 +4,7 @@
 //! 与 tian_rt.c 的编译产物由系统链接器（cc）合成可执行文件——与 rustc 的链接策略一致。
 //! 整数除零走 __t_panic 快速失败（v3.2，与 C 后端一致，规范第 15 节）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use cranelift_codegen::ir::types;
 use cranelift_codegen::ir::{
@@ -19,7 +19,7 @@ use cranelift_module::{default_libcall_names, DataDescription, DataId, FuncId, L
 use cranelift_object::{ObjectBuilder, ObjectModule};
 
 use crate::ast::*;
-use crate::type_check::{arrs, collect_str_decls, consumes_var, darr_by_id, darrs, is_owned, map_by_id, maps, norm, set_arrs, set_darrs, set_structs, set_tuples, structs, FuncSig};
+use crate::type_check::{arrs, collect_str_decls, consumes_var, darr_by_id, darrs, enums, is_owned, map_by_id, maps, norm, set_arrs, set_darrs, set_enums, set_structs, set_tuples, structs, FuncSig};
 
 /// 指针类型：64 位宿主（aarch64/x86_64）为 I64
 fn ptr_ty() -> Type {
@@ -44,6 +44,8 @@ fn cl_ty(t: Ty) -> Type {
         Ty::Map(_) => ptr_ty(),
         // v4.5：元组 = 指向 malloc 块的堆指针（规范第 24 节；仅存在于返回边界）
         Ty::Tuple(_) => ptr_ty(),
+        // v4.9：枚举 = 堆句柄指针（规范第 26 节；间接 16 字节块满足递归类型）
+        Ty::Enum(_) => ptr_ty(),
     }
 }
 
@@ -61,7 +63,7 @@ pub fn generate_object(prog: &Program) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("ObjectBuilder 创建失败: {}", e))?;
     let mut module = ObjectModule::new(builder);
 
-    let rt = Runtime::declare(&mut module);
+    let mut rt = Runtime::declare(&mut module);
 
     // v3.0：结构体表注入线程局部，供后续 emit_* 查询布局（与 gen_c 同策略）
     set_structs(&prog.structs);
@@ -69,6 +71,7 @@ pub fn generate_object(prog: &Program) -> Result<Vec<u8>, String> {
     set_darrs(&prog.darrs);
     set_tuples(&prog.tuples);
     crate::type_check::set_maps(&prog.maps);
+    set_enums(&prog.enums);
 
     // 模块级字符串字面量池：全局去重，命名全局唯一（跨函数共享）
     let mut str_pool: HashMap<String, DataId> = HashMap::new();
@@ -106,6 +109,26 @@ pub fn generate_object(prog: &Program) -> Result<Vec<u8>, String> {
     }
 
     let mut fb_ctx = FunctionBuilderContext::new();
+
+    // v4.9：声明+生成每个枚举的深释放函数 __t_efree_{idx}（tag 分派递归释放；规范第 26 节）。
+    // 必须在编译函数之前注册：函数体内的枚举局部（含返回枚举）在作用域结束时需按 efree 深释放。
+    // 先全部声明（含 self/cross 递归引用），再逐个定义（efree 由 func_addr 作回调传 __t_dfree_e/__t_mfree_se）。
+    let enum_ids: Vec<FuncId> = (0..enums().len())
+        .map(|idx| {
+            let mut csig = module.make_signature();
+            csig.params.push(AbiParam::new(ptr_ty()));
+            module
+                .declare_function(&format!("__t_efree_{}", idx), Linkage::Local, &csig)
+                .map_err(|e| format!("声明枚举深释放函数失败: {}", e))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    for (idx, id) in enum_ids.iter().enumerate() {
+        rt.efree.insert(idx, *id);
+    }
+    for (idx, id) in enum_ids.iter().enumerate() {
+        gen_efree(&mut module, &mut fb_ctx, &rt, idx, *id)?;
+    }
+
     for (idx, f) in prog.funcs.iter().enumerate() {
         let fsig = sigs[&f.name].clone();
         let (id, _) = decls[&f.name];
@@ -153,6 +176,9 @@ struct Runtime {
     dpush_s: FuncId,
     dget_s: FuncId,
     dfree_s: FuncId,
+    // v4.9：枚举元素动态数组（规范第 26 节）
+    dpush_e: FuncId,
+    dget_e: FuncId,
     sget: FuncId,
     sub: FuncId,
     tof: FuncId,
@@ -207,6 +233,19 @@ struct Runtime {
     sort_s: FuncId,
     // v4.8：cat []str → 新 str
     dcat_s: FuncId,
+    // v4.9：枚举运行时（规范第 26 节）
+    enum_new: FuncId,
+    enum_tag: FuncId,
+    dfree_e: FuncId,
+    mfree_se: FuncId,
+    /// v4.9：枚举作 map 值——按键 wire 分派的 mset/mget（值按 void* 句柄存储，mset 携带 efree 回调）
+    mget_ie: FuncId,
+    mget_se: FuncId,
+    mset_ie: FuncId,
+    mset_se: FuncId,
+    mfree_ie: FuncId,
+    /// v4.9：各枚举的深释放函数 FuncId（按枚举表索引；match `_` 臂与枚举变量释放用）
+    efree: std::collections::HashMap<usize, FuncId>,
 }
 
 impl Runtime {
@@ -256,6 +295,8 @@ impl Runtime {
             dset_f: mk("__t_dset_f", vec![ptr_ty(), types::I64, types::F64], None),
             dpush_i: mk("__t_dpush_i", vec![ptr_ty(), types::I64], Some(ptr_ty())),
             dpush_f: mk("__t_dpush_f", vec![ptr_ty(), types::F64], Some(ptr_ty())),
+            dpush_e: mk("__t_dpush_e", vec![ptr_ty(), ptr_ty()], Some(ptr_ty())),
+            dget_e: mk("__t_dget_e", vec![ptr_ty(), types::I64], Some(ptr_ty())),
             // v4.7：关联数组（规范第 25 节）；has 返回 long long（0/1），视同 seq 读低 32 位
             mnew: mk("__t_mnew", vec![types::I64], Some(ptr_ty())),
             mlen: mk("__t_mlen", vec![ptr_ty()], Some(types::I64)),
@@ -287,6 +328,18 @@ impl Runtime {
             mfree_ss: mk("__t_mfree_ss", vec![ptr_ty()], None),
             mkeys_i: mk("__t_mkeys_i", vec![ptr_ty()], Some(ptr_ty())),
             mkeys_s: mk("__t_mkeys_s", vec![ptr_ty()], Some(ptr_ty())),
+            // v4.9：枚举运行时（规范第 26 节）
+            enum_new: mk("__t_enum_new", vec![types::I64, types::I64], Some(ptr_ty())),
+            enum_tag: mk("__t_enum_tag", vec![ptr_ty()], Some(types::I64)),
+            dfree_e: mk("__t_dfree_e", vec![ptr_ty(), ptr_ty()], None),
+            mfree_se: mk("__t_mfree_se", vec![ptr_ty(), ptr_ty()], None),
+            // v4.9：枚举作 map 值——mset/mget/mfree（v 为枚举句柄；mset 尾参 efree 回调以深释放旧值）
+            mget_ie: mk("__t_mget_ie", vec![ptr_ty(), types::I64], Some(ptr_ty())),
+            mget_se: mk("__t_mget_se", vec![ptr_ty(), ptr_ty()], Some(ptr_ty())),
+            mset_ie: mk("__t_mset_ie", vec![ptr_ty(), types::I64, ptr_ty(), ptr_ty()], Some(ptr_ty())),
+            mset_se: mk("__t_mset_se", vec![ptr_ty(), ptr_ty(), ptr_ty(), ptr_ty()], Some(ptr_ty())),
+            mfree_ie: mk("__t_mfree_ie", vec![ptr_ty(), ptr_ty()], None),
+            efree: std::collections::HashMap::new(),
             // v4.7：values —— 值快照，按值 wire 分派
             mvalues_i: mk("__t_mvalues_i", vec![ptr_ty()], Some(ptr_ty())),
             mvalues_f: mk("__t_mvalues_f", vec![ptr_ty()], Some(ptr_ty())),
@@ -428,6 +481,30 @@ fn m_key_read(
     }
 }
 
+/// v4.9：map 值是否为枚举；返回枚举表索引（枚举作 map 值时走 mset_*e/mget_*e/mfree_*e）
+fn mval_enum(m: &MapDef) -> Option<usize> {
+    match m.val {
+        Ty::Enum(i) => Some(i as usize),
+        _ => None,
+    }
+}
+
+/// v4.9：取枚举深释放函数（efree）的函数指针，作为 mset_*e 尾参回调（旧值深释放）
+fn map_efree_ptr(
+    ei: usize,
+    ctx: &mut FnCtx,
+    builder: &mut FunctionBuilder,
+) -> Result<Value, String> {
+    let id = ctx.rt.efree.get(&ei).copied().ok_or("枚举深释放函数未生成")?;
+    let fref = ctx.module.declare_func_in_func(id, &mut builder.func);
+    Ok(builder.ins().func_addr(ptr_ty(), fref))
+}
+
+/// v4.9：枚举作 map 值时的 mset/mget/mfree 函数（按键 wire = 键类型选择变体）
+fn mset_ef(rt: &Runtime, key: Ty) -> FuncId { if key == Ty::Str { rt.mset_se } else { rt.mset_ie } }
+fn mget_ef(rt: &Runtime, key: Ty) -> FuncId { if key == Ty::Str { rt.mget_se } else { rt.mget_ie } }
+fn mfree_ef(rt: &Runtime, key: Ty) -> FuncId { if key == Ty::Str { rt.mfree_se } else { rt.mfree_ie } }
+
 /// 构造 map 字面量：__t_mnew(8) + 逐条目 __t_mset_*（返回新句柄；规范第 25 节）
 fn emit_map_lit_native(
     md: &MapDef,
@@ -438,8 +515,20 @@ fn emit_map_lit_native(
     let cap = builder.ins().iconst(types::I64, 8);
     let mut h = call_rt(ctx, builder, ctx.rt.mnew, types::I64, 1, Some(ptr_ty()), &[cap])?
         .ok_or("__t_mnew 无返回值")?;
-    let setf = mset_f(ctx.rt, md);
     let kw = mkey_wire(md.key);
+    // v4.9：枚举作 map 值——字面量走 mset_*e（值句柄 + efree 回调尾参）；否则通用 mset_*
+    if let Some(ei) = mval_enum(md) {
+        let setf = mset_ef(ctx.rt, md.key);
+        for (k, v) in entries.iter() {
+            let ka = m_operand(k, kw, ctx, builder)?;
+            let (va, _) = emit_expr(v, ctx, builder)?;
+            let fp = map_efree_ptr(ei, ctx, builder)?;
+            h = call_rt(ctx, builder, setf, ptr_ty(), 4, Some(ptr_ty()), &[h, ka, va, fp])?
+                .ok_or("__t_mset_*e 无返回值")?;
+        }
+        return Ok(h);
+    }
+    let setf = mset_f(ctx.rt, md);
     let vw = mval_wire(md.val);
     for (k, v) in entries.iter() {
         let ka = m_operand(k, kw, ctx, builder)?;
@@ -456,6 +545,9 @@ struct FnCtx<'a> {
     rt: &'a Runtime,
     decls: &'a HashMap<String, (FuncId, Signature)>,
     vars: HashMap<String, (Variable, Ty)>,
+    /// v4.9：借用变量集合（只读容器元素读取赋值而来，如 `//y=a[i]`）。
+    /// match 借用枚举时不得释放其包装句柄（容器仍持有），避免双重释放。
+    borrow_vars: HashSet<String>,
     var_count: u32,
     /// 模块级字符串池（跨函数共享，去重）
     str_pool: &'a mut HashMap<String, DataId>,
@@ -489,6 +581,7 @@ fn compile_fn(
         rt,
         decls,
         vars: HashMap::new(),
+        borrow_vars: HashSet::new(),
         var_count: 0,
         str_pool,
         str_count,
@@ -668,6 +761,8 @@ fn empty_or_zero(
             Ty::Tuple(_) => builder.ins().iconst(ptr_ty(), 0),
             // v4.7：关联数组零值 = 空指针（规范第 25 节）
             Ty::Map(_) => builder.ins().iconst(ptr_ty(), 0),
+            // v4.9：枚举零值 = 空指针（规范第 26 节）
+            Ty::Enum(_) => builder.ins().iconst(ptr_ty(), 0),
             // 借用不可作为返回类型（检查器已拦截）
             Ty::Str | Ty::BorrowStr => unreachable!(),
         })
@@ -699,6 +794,7 @@ fn compile_top(
             rt,
             decls,
             vars: HashMap::new(),
+            borrow_vars: HashSet::new(),
             var_count: 0,
             str_pool,
             str_count,
@@ -895,6 +991,11 @@ fn emit_stmt(
                                 let v = coerce(builder, v, vt, Ty::F64)?;
                                 h = call_rt(ctx, builder, ctx.rt.dpush_f, types::F64, 2, Some(ptr_ty()), &[h, v])?
                                     .ok_or("__t_dpush_f 无返回值")?;
+                            } else if de.elem.is_enum() {
+                                // v4.9：枚举元素移动进数组
+                                let v = coerce(builder, v, vt, de.elem)?;
+                                h = call_rt(ctx, builder, ctx.rt.dpush_e, ptr_ty(), 2, Some(ptr_ty()), &[h, v])?
+                                    .ok_or("__t_dpush_e 无返回值")?;
                             } else {
                                 // v4.6：Bool 元素桥接为 I64（ABI 与 C 后端一致）
                                 let (v, abt) = coerce_darr_elem(builder, v, vt, de.elem)?;
@@ -916,7 +1017,18 @@ fn emit_stmt(
                         if !consumed {
                             // v4.2：str 元素容器用深释放（规范 22.6）
                             let f = if de.elem == Ty::Str { ctx.rt.dfree_s } else { ctx.rt.free };
-                            call_rt(ctx, builder, f, ptr_ty(), 1, None, &[old])?;
+                            if de.elem.is_enum() {
+                                let ei = match de.elem {
+                                    Ty::Enum(e) => e as usize,
+                                    _ => unreachable!(),
+                                };
+                                let id = ctx.rt.efree.get(&ei).copied().ok_or("枚举深释放函数未生成")?;
+                                let fref = ctx.module.declare_func_in_func(id, &mut builder.func);
+                                let fp = builder.ins().func_addr(ptr_ty(), fref);
+                                call_rt(ctx, builder, ctx.rt.dfree_e, ptr_ty(), 2, None, &[old, fp])?;
+                            } else {
+                                call_rt(ctx, builder, f, ptr_ty(), 1, None, &[old])?;
+                            }
                         }
                         emit_move_nulls_native(value, true, ctx, builder)?;
                         builder.def_var(var, val);
@@ -949,6 +1061,21 @@ fn emit_stmt(
                     _ => return Err("数组声明的 RHS 非法（应被 type_check 拦截）".into()),
                 }
                 emit_move_nulls_native(value, false, ctx, builder)?;
+                let _ = mutable;
+                return Ok(());
+            }
+            if is_owned(t) && is_borrow_elem_read(value, ctx) {
+                // v4.9：只读容器元素读取（如 `[]Json` 的 arr[i]）返回容器仍持有的句柄——
+                // 借用语义：全新栈槽、不释放旧值、不入出口释放清单（collect_str_decls 已跳过）。
+                // 避免与容器自身的深层释构成双重释放（C 后端宽松掩盖、原生立即崩）。
+                let (v, vt) = emit_expr(value, ctx, builder)?;
+                let val = coerce(builder, v, vt, t)?;
+                let var = Variable::from_u32(ctx.var_count);
+                ctx.var_count += 1;
+                builder.declare_var(var, cl_ty(t));
+                builder.def_var(var, val);
+                ctx.vars.insert(name.clone(), (var, t));
+                ctx.borrow_vars.insert(name.clone());
                 let _ = mutable;
                 return Ok(());
             }
@@ -1161,6 +1288,22 @@ fn emit_stmt(
                         let (bp, _) = emit_expr(base, ctx, builder)?;
                         let kw = mkey_wire(md.key);
                         let k = m_operand(idx, kw, ctx, builder)?;
+                        // v4.9：枚举作 map 值——mset_*e（值句柄 + efree 回调深释放旧值）；否则通用 mset_*
+                        if let Some(ei) = mval_enum(&md) {
+                            // v4.9：枚举值本身是 ptr 句柄，直接作 mset_*e 的 v 参（无需 coerce）
+                            let (val, _) = emit_expr(value, ctx, builder)?;
+                            let fp = map_efree_ptr(ei, ctx, builder)?;
+                            let setf = mset_ef(ctx.rt, md.key);
+                            let nh = call_rt(ctx, builder, setf, ptr_ty(), 4, Some(ptr_ty()), &[bp, k, val, fp])?
+                                .ok_or("__t_mset_*e 无返回值")?;
+                            if let Expr::Var(n) = base.as_ref() {
+                                if let Some((var, _)) = ctx.vars.get(n) {
+                                    builder.def_var(*var, nh);
+                                }
+                            }
+                            emit_move_nulls_native(value, true, ctx, builder)?;
+                            return Ok(());
+                        }
                         let vw = mval_wire(md.val);
                         let va = if vw == "s" {
                             emit_bind_native(value, ctx, builder)?
@@ -1234,6 +1377,8 @@ fn emit_stmt(
                 // v4.5：元组不可直接打印（仅存在于返回边界，需先解构）
                 Ty::Tuple(_) => unreachable!("元组不可直接打印（检查器已拦截）"),
                 Ty::Map(_) => unreachable!("map 不可直接打印（检查器已拦截）"),
+                // v4.9：枚举不可直接打印（需先 match 解构）
+                Ty::Enum(_) => unreachable!("枚举不可直接打印（检查器已拦截）"),
             };
             let arg = coerce_print(builder, val, t, arg_ty)?;
             call_rt(ctx, builder, rt_fn, arg_ty, 1, None, &[arg])?;
@@ -1359,6 +1504,15 @@ fn emit_stmt(
                 return Ok(());
             }
             let (v, vt) = emit_expr(value, ctx, builder)?;
+            if de.elem.is_enum() {
+                // v4.9：枚举元素移动进数组（槽位存句柄；值域移动，源置空）
+                let v = coerce(builder, v, vt, de.elem)?;
+                let h = call_rt(ctx, builder, ctx.rt.dpush_e, ptr_ty(), 2, Some(ptr_ty()), &[dst, v])?
+                    .ok_or("__t_dpush_e 无返回值")?;
+                builder.def_var(var, h);
+                emit_move_nulls_native(value, true, ctx, builder)?;
+                return Ok(());
+            }
             if de.elem == Ty::F64 {
                 let v = coerce(builder, v, vt, Ty::F64)?;
                 let h = call_rt(ctx, builder, ctx.rt.dpush_f, types::F64, 2, Some(ptr_ty()), &[dst, v])?
@@ -1468,6 +1622,150 @@ fn emit_stmt(
             builder.switch_to_block(ok_blk);
             Ok(())
         }
+        // v4.9：enum 匹配（语句级穷尽分派，规范第 26 节）——C 后端 switch(tag) 映射为 tag 的 brif 级联；
+        // 变体臂：owned payload 绑定前先置空槽位（所有权移交绑定变量）→ 臂体 → 释放绑定与包装；
+        // `_` 臂：整枚举深释放（efree）。所有臂汇入 end 块后继续执行后续语句。
+        Stmt::Match {
+            scrutinee,
+            arms,
+            line: _,
+        } => {
+            let st = norm(emit_ty_of(scrutinee, ctx).ok_or("match 被匹配值类型未知（编译器内部错误）")?);
+            let enum_tab = enums();
+            let ed = match st {
+                Ty::Enum(i) => enum_tab[i as usize].clone(),
+                _ => unreachable!("match 非枚举（应被 type_check 拦截）"),
+            };
+            let (sv, svt) = emit_expr(scrutinee, ctx, builder)?;
+            let e = coerce(builder, sv, svt, st)?;
+            // v4.9：借用枚举（只读容器元素读取，如 `//y=a[i]`）——包装句柄仍由容器持有，
+            // match 只取走 payload（null 槽），不得释放包装，否则与容器深释放构成双重释放。
+            let borrowed = match scrutinee.as_ref() {
+                Expr::Var(n) => ctx.borrow_vars.contains(n),
+                other => is_borrow_elem_read(other, ctx),
+            };
+            emit_move_nulls_native(scrutinee, true, ctx, builder)?;
+            let tag = call_rt(ctx, builder, ctx.rt.enum_tag, ptr_ty(), 1, Some(types::I64), &[e])?
+                .ok_or("__t_enum_tag 无返回值")?;
+            let end = builder.create_block();
+            // （blk, vi, arm_idx, bind, pt）：vi=None 为通配
+            #[derive(Clone)]
+            struct Tgt {
+                blk: Block,
+                vi: Option<usize>,
+                arm: usize,
+                bind: Option<String>,
+                pt: Option<Ty>,
+            }
+            let mut targets: Vec<Tgt> = Vec::new();
+            for (arm_idx, arm) in arms.iter().enumerate() {
+                for pat in &arm.pats {
+                    let blk = builder.create_block();
+                    match pat {
+                        Pat::Wild => targets.push(Tgt { blk, vi: None, arm: arm_idx, bind: None, pt: None }),
+                        Pat::Variant { name, bind } => {
+                            let vi = ed
+                                .variants
+                                .iter()
+                                .position(|v| &v.name == name)
+                                .expect("枚举变体不存在（检查器已拦截）");
+                            let pt = ed.variants[vi].payload;
+                            targets.push(Tgt { blk, vi: Some(vi), arm: arm_idx, bind: bind.clone(), pt });
+                        }
+                    }
+                }
+            }
+            // 分派级联：逐变体 brif；全部判完进 end（穷尽）或 default（通配）
+            let mut default_blk: Option<(Block, usize)> = None;
+            let mut variant_chain: Vec<&Tgt> = Vec::new();
+            for t in &targets {
+                match t.vi {
+                    Some(_) => variant_chain.push(t),
+                    None => { if default_blk.is_none() { default_blk = Some((t.blk, t.arm)); } }
+                }
+            }
+            for (i, t) in variant_chain.iter().enumerate() {
+                let vi = t.vi.unwrap();
+                let last = i == variant_chain.len() - 1 && default_blk.is_none();
+                let av = builder.ins().iconst(types::I64, vi as i64);
+                let isv = builder.ins().icmp(IntCC::Equal, tag, av);
+                if last {
+                    builder.ins().brif(isv, t.blk, &[], end, &[]);
+                    builder.seal_block(t.blk);
+                } else {
+                    let nxt = builder.create_block();
+                    builder.ins().brif(isv, t.blk, &[], nxt, &[]);
+                    builder.seal_block(t.blk);
+                    builder.seal_block(nxt);
+                    builder.switch_to_block(nxt);
+                }
+            }
+            if let Some((db, _)) = default_blk {
+                builder.ins().jump(db, &[]);
+                builder.seal_block(db);
+            }
+            // 填充各臂体。通配数>1/重复变体走 no-op（不可达但需封口），仅首个通配真填充
+            let mut filled_default = false;
+            for t in &targets {
+                builder.switch_to_block(t.blk);
+                let owning = t.bind.is_some() && t.pt.map(is_owned).unwrap_or(false);
+                if t.bind.is_some() {
+                    let bn = t.bind.clone().unwrap();
+                    let pt = t.pt.unwrap();
+                    // payload 槽回读（标量解码；容器/枚举句柄按指针宽度），随后置空（所有权移交绑定变量）
+                    let pv = match pt {
+                        Ty::I32 | Ty::I64 | Ty::Bool | Ty::F64 => load_field(builder, e, 8, pt)?,
+                        _ => builder.ins().load(ptr_ty(), MemFlags::new(), e, 8),
+                    };
+                    if owning {
+                        let z = builder.ins().iconst(ptr_ty(), 0);
+                        builder.ins().store(MemFlags::new(), z, e, 8);
+                    }
+                    let var = Variable::from_u32(ctx.var_count);
+                    ctx.var_count += 1;
+                    builder.declare_var(var, cl_ty(pt));
+                    builder.def_var(var, pv);
+                    ctx.vars.insert(bn.clone(), (var, pt));
+                }
+                let arm_body = &arms[t.arm].body;
+                if t.vi.is_none() && filled_default {
+                    builder.ins().jump(end, &[]);
+                    builder.seal_block(t.blk);
+                    continue;
+                }
+                if t.vi.is_some() {
+                    emit_block(ctx, builder, arm_body, fn_ret)?;
+                } else {
+                    // 通配体：释放整个枚举后执行通配语句（借用枚举跳过——包装仍属容器）
+                    emit_block(ctx, builder, arm_body, fn_ret)?;
+                    if !ctx.block_terminated {
+                        if !borrowed {
+                            emit_deep_free(e, st, ctx, builder)?;
+                        }
+                        builder.ins().jump(end, &[]);
+                    }
+                    filled_default = true;
+                }
+                // 变体臂收口：释放绑定（owned）→ 释放包装（借用枚举跳过包装所有权，仍取走 payload）
+                if t.vi.is_some() && !ctx.block_terminated {
+                    if owning {
+                        let (var, pt) = *ctx.vars.get(t.bind.as_ref().unwrap()).unwrap();
+                        let pv = builder.use_var(var);
+                        emit_deep_free(pv, pt, ctx, builder)?;
+                        ctx.vars.remove(t.bind.as_ref().unwrap());
+                    }
+                    if !borrowed {
+                        call_rt(ctx, builder, ctx.rt.free, ptr_ty(), 1, None, &[e])?;
+                    }
+                    builder.ins().jump(end, &[]);
+                }
+            }
+            // 统一切到 end 收尾；match 不终止控制流（即使某臂 return，后续语句仍按序发射进 end）
+            builder.switch_to_block(end);
+            builder.seal_block(end);
+            ctx.block_terminated = false;
+            Ok(())
+        }
         // v4.5：多声明解构 //a, b = f(...) —— 元素按类型接管，块随即释放（规范第 24 节）
         Stmt::MultiDecl { names, value, .. } => {
             let vt = emit_ty_of(value, ctx).ok_or("MultiDecl RHS 类型未知（编译器内部错误）")?;
@@ -1541,6 +1839,34 @@ fn coerce_print(
         Ty::Tuple(_) => unreachable!("元组不可直接打印（检查器已拦截）"),
         // v4.7：map 不可直接打印（检查器已拦截）
         Ty::Map(_) => unreachable!("map 不可直接打印（检查器已拦截）"),
+        // v4.9：枚举不可直接打印（检查器已拦截）
+        Ty::Enum(_) => unreachable!("枚举不可直接打印（检查器已拦截）"),
+    }
+}
+
+/// v4.9：判断 value 是否"只读容器元素读取"（如 `[]Json` 的 arr[i]、`map[str]Json` 的 m[k]）。
+/// 返回的句柄由容器持有，读方为借用——不释放、不入深释清单（见 Stmt::Decl 的 is_borrow_elem_read 分支）。
+fn is_borrow_elem_read(value: &Expr, ctx: &FnCtx) -> bool {
+    match value {
+        Expr::Index(base, _) => {
+            if let Expr::Var(n) = base.as_ref() {
+                if let Some((_, bt)) = ctx.vars.get(n) {
+                    return match bt {
+                        Ty::DArr(i) => darrs()
+                            .get(*i as usize)
+                            .map(|d| is_owned(d.elem))
+                            .unwrap_or(false),
+                        Ty::Map(i) => maps()
+                            .get(*i as usize)
+                            .map(|m| is_owned(m.val))
+                            .unwrap_or(false),
+                        _ => false,
+                    };
+                }
+            }
+            false
+        }
+        _ => false,
     }
 }
 
@@ -1611,6 +1937,8 @@ fn emit_ty_of(e: &Expr, ctx: &FnCtx) -> Option<Ty> {
         Expr::Del { .. } => None,
         Expr::Sub { .. } => Some(Ty::Str),
         Expr::Cat { .. } => Some(Ty::Str),
+        // v4.9：枚举构造类型 = 枚举索引
+        Expr::EnumCtor { en, .. } => Some(Ty::Enum(*en)),
         // v4.5：元组表达式类型 = Ty::Tuple(tup)
         Expr::TupExpr { tup, .. } => Some(Ty::Tuple(*tup)),
         Expr::Push { .. } => None,
@@ -1934,6 +2262,8 @@ fn store_field(builder: &mut FunctionBuilder, base: Value, offset: i32, ft: Ty, 
         // v4.5：元组仅存在于返回边界，不可作为结构体字段（规范 24.2）
         Ty::Tuple(_) => unreachable!("元组不可作为结构体字段（检查器已拦截）"),
         Ty::Map(_) => unreachable!("map 不可作为结构体字段（检查器已拦截）"),
+        // v4.9：枚举为堆句柄指针，按指针宽度存储
+        Ty::Enum(_) => { builder.ins().store(MemFlags::new(), v, base, offset); }
     }
 }
 
@@ -1957,6 +2287,8 @@ fn load_field(builder: &mut FunctionBuilder, base: Value, offset: i32, ft: Ty) -
         // v4.5：元组仅存在于返回边界，不可作为结构体字段（规范 24.2）
         Ty::Tuple(_) => Err("元组不可作为结构体字段（应被 type_check 拦截）".into()),
         Ty::Map(_) => Err("map 不可作为结构体字段（应被 type_check 拦截）".into()),
+        // v4.9：枚举堆句柄按指针宽度读取
+        Ty::Enum(_) => Ok(builder.ins().load(ptr_ty(), MemFlags::new(), base, offset)),
     }
 }
 
@@ -1974,13 +2306,44 @@ fn emit_deep_free(
             _ => unreachable!(),
         };
         let f = if de.elem == Ty::Str { ctx.rt.dfree_s } else { ctx.rt.free };
-        call_rt(ctx, builder, f, ptr_ty(), 1, None, &[ptr])?;
+        if de.elem.is_enum() {
+            // v4.9：枚举元素数组——逐元素回调 efree 深释放（规范第 26 节）
+            let ei = match de.elem {
+                Ty::Enum(e) => e as usize,
+                _ => unreachable!(),
+            };
+            let id = ctx.rt.efree.get(&ei).copied().ok_or("枚举深释放函数未生成")?;
+            let fref = ctx.module.declare_func_in_func(id, &mut builder.func);
+            let fp = builder.ins().func_addr(ptr_ty(), fref);
+            call_rt(ctx, builder, ctx.rt.dfree_e, ptr_ty(), 2, None, &[ptr, fp])?;
+        } else {
+            call_rt(ctx, builder, f, ptr_ty(), 1, None, &[ptr])?;
+        }
         return Ok(());
     }
     if t.is_map() {
         // v4.7：关联数组释放——按 wire 选择 __t_mfree_*，str 键/值深释放（规范第 25 节）
-        let mf = mfree_f(ctx.rt, &mdef_of(t));
-        call_rt(ctx, builder, mf, ptr_ty(), 1, None, &[ptr])?;
+        // v4.9：值若为枚举走 __t_mfree_*e（深释放各枚举值，回调尾参）
+        let m = mdef_of(t);
+        if let Some(ei) = mval_enum(&m) {
+            let fp = map_efree_ptr(ei, ctx, builder)?;
+            let mf = mfree_ef(ctx.rt, m.key);
+            call_rt(ctx, builder, mf, ptr_ty(), 2, None, &[ptr, fp])?;
+        } else {
+            let mf = mfree_f(ctx.rt, &m);
+            call_rt(ctx, builder, mf, ptr_ty(), 1, None, &[ptr])?;
+        }
+        return Ok(());
+    }
+    if t.is_enum() {
+        // v4.9：枚举深释放——按 tag 分派变体，递归容器由 __t_dfree_e/__t_mfree_se 回调（规范第 26 节）
+        let idx = match t {
+            Ty::Enum(i) => i as usize,
+            _ => unreachable!(),
+        };
+        let id = *ctx.rt.efree.get(&idx).ok_or("枚举深释放函数未生成（编译器内部错误）")?;
+        let fref = ctx.module.declare_func_in_func(id, &mut builder.func);
+        builder.ins().call(fref, &[ptr]);
         return Ok(());
     }
     let id = match t {
@@ -2013,6 +2376,122 @@ fn emit_deep_free(
     builder.ins().jump(skip, &[]);
     builder.switch_to_block(skip);
     builder.seal_block(skip);
+    Ok(())
+}
+
+/// v4.9：释放枚举变体 payload 槽（按声明类型；递归容器由 __t_dfree_e/__t_mfree_se 传本枚举 efree 回调）。
+/// 标量/空 payload 无持有；struct/其他枚举/定长数组/元组本轮声明校验已拦截，防御性为空。
+fn enum_payload_free(
+    pt: Ty,
+    p: Value,
+    ctx: &mut FnCtx,
+    builder: &mut FunctionBuilder,
+) -> Result<(), String> {
+    match pt {
+        Ty::Str => {
+            call_rt(ctx, builder, ctx.rt.free, ptr_ty(), 1, None, &[p])?;
+        }
+        Ty::I32 | Ty::I64 | Ty::Bool | Ty::F64 => {}
+        Ty::DArr(i) => {
+            let d = darrs()[i as usize].clone();
+            if let Ty::Enum(ei) = d.elem {
+                let id = ctx.rt.efree.get(&(ei as usize)).copied().ok_or("枚举深释放函数未生成")?;
+                let fref = ctx.module.declare_func_in_func(id, &mut builder.func);
+                let fp = builder.ins().func_addr(ptr_ty(), fref);
+                call_rt(ctx, builder, ctx.rt.dfree_e, ptr_ty(), 2, None, &[p, fp])?;
+            }
+        }
+        Ty::Map(i) => {
+            let m = maps()[i as usize].clone();
+            if let Ty::Enum(ei) = m.val {
+                let id = ctx.rt.efree.get(&(ei as usize)).copied().ok_or("枚举深释放函数未生成")?;
+                let fref = ctx.module.declare_func_in_func(id, &mut builder.func);
+                let fp = builder.ins().func_addr(ptr_ty(), fref);
+                call_rt(ctx, builder, mfree_ef(ctx.rt, m.key), ptr_ty(), 2, None, &[p, fp])?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// v4.9：生成单个枚举的深释放函数 __t_efree_{idx}：读 tag → 逐变体 brif 级联 →
+/// 命中变体释 payload 槽 + free 包装（16 字节块）；末尾 else 理论不可达（tag 恒为合法变体）。
+fn gen_efree(
+    module: &mut ObjectModule,
+    fb_ctx: &mut FunctionBuilderContext,
+    rt: &Runtime,
+    idx: usize,
+    f: FuncId,
+) -> Result<(), String> {
+    let ed = enums()[idx].clone();
+    let mut csig = module.make_signature();
+    csig.params.push(AbiParam::new(ptr_ty()));
+    let mut func = Function::with_name_signature(UserFuncName::user(1, idx as u32), csig);
+    let mut str_pool: HashMap<String, DataId> = HashMap::new();
+    let mut str_count = 0usize;
+    let empty_sigs: HashMap<String, FuncSig> = HashMap::new();
+    let empty_decls: HashMap<String, (FuncId, Signature)> = HashMap::new();
+    let mut ctx = FnCtx {
+        module,
+        sigs: &empty_sigs,
+        rt,
+        decls: &empty_decls,
+        vars: HashMap::new(),
+        borrow_vars: HashSet::new(),
+        var_count: 0,
+        str_pool: &mut str_pool,
+        str_count: &mut str_count,
+        block_terminated: false,
+        post: None,
+        fname: "enum_free",
+        loop_stack: Vec::new(),
+    };
+    let mut builder = FunctionBuilder::new(&mut func, fb_ctx);
+    let entry = builder.create_block();
+    builder.append_block_params_for_function_params(entry);
+    builder.switch_to_block(entry);
+    builder.seal_block(entry);
+    let e = builder.func.dfg.block_params(entry)[0];
+    // v4.9：NULL 守卫——枚举变量可被移动置空、未初始化前槽位为 0，free(NULL) 安全（对齐 C 后端 if(!e)return）
+    let end = builder.create_block();
+    let zero = builder.ins().iconst(ptr_ty(), 0);
+    let is_null = builder.ins().icmp(IntCC::Equal, e, zero);
+    let free_body = builder.create_block();
+    builder.ins().brif(is_null, end, &[], free_body, &[]);
+    builder.seal_block(free_body);
+    builder.switch_to_block(free_body);
+    let tag = builder.ins().load(types::I64, MemFlags::new(), e, 0);
+    let p = builder.ins().load(ptr_ty(), MemFlags::new(), e, 8);
+    for (i, v) in ed.variants.iter().enumerate() {
+        let body = builder.create_block();
+        let nxt = builder.create_block();
+        let av = builder.ins().iconst(types::I64, i as i64);
+        let isv = builder.ins().icmp(IntCC::Equal, tag, av);
+        builder.ins().brif(isv, body, &[], nxt, &[]);
+        builder.seal_block(body);
+        builder.seal_block(nxt);
+        builder.switch_to_block(body);
+        if let Some(pt) = v.payload {
+            enum_payload_free(pt, p, &mut ctx, &mut builder)?;
+        }
+        let fr = ctx.rt.free;
+        call_rt(&mut ctx, &mut builder, fr, ptr_ty(), 1, None, &[e])?;
+        builder.ins().jump(end, &[]);
+        builder.switch_to_block(nxt);
+    }
+    // 级联末尾：除最后一个变体外的其余 tag 在此汇入（穷尽覆盖，理论不可达；跳 end 收尾）
+    builder.ins().jump(end, &[]);
+    builder.switch_to_block(end);
+    builder.seal_block(end);
+    builder.ins().return_(&[]);
+    builder.finalize();
+    let mut mc = module.make_context();
+    mc.func = std::mem::replace(&mut func, Function::new());
+    module
+        .define_function(f, &mut mc)
+        .map_err(|e| format!("定义枚举深释放函数失败: {}", e))?;
+    module.clear_context(&mut mc);
     Ok(())
 }
 
@@ -2131,6 +2610,12 @@ fn emit_expr(
             if let Some(md) = map_by_id(&maps(), bt).cloned() {
                 // v4.7：m[k] 读——键 coerced 到 i64/str，取 __t_mget_{wire}
                 let k = m_operand(idx, mkey_wire(md.key), ctx, builder)?;
+                // v4.9：枚举作 map 值——__t_mget_*e 返回枚举句柄（ptr）
+                if mval_enum(&md).is_some() {
+                    let r = call_rt(ctx, builder, mget_ef(ctx.rt, md.key), ptr_ty(), 2, Some(ptr_ty()), &[bp, k])?
+                        .ok_or("__t_mget_*e 无返回值")?;
+                    return Ok((r, md.val));
+                }
                 let ret = if mval_wire(md.val) == "f" {
                     types::F64
                 } else if mval_wire(md.val) == "s" {
@@ -2158,6 +2643,12 @@ fn emit_expr(
                     let r = call_rt(ctx, builder, ctx.rt.dget_s, types::I64, 2, Some(ptr_ty()), &[bp, i])?
                         .ok_or("__t_dget_s 无返回值")?;
                     return Ok((r, Ty::Str));
+                }
+                if de.elem.is_enum() {
+                    // v4.9：枚举元素读取（槽位为句柄）
+                    let r = call_rt(ctx, builder, ctx.rt.dget_e, ptr_ty(), 2, Some(ptr_ty()), &[bp, i])?
+                        .ok_or("__t_dget_e 无返回值")?;
+                    return Ok((r, de.elem));
                 }
                 let r = call_rt(ctx, builder, ctx.rt.dget_i, types::I64, 2, Some(types::I64), &[bp, i])?
                     .ok_or("__t_dget_i 无返回值")?;
@@ -2299,6 +2790,11 @@ fn emit_expr(
                 if t == Ty::Str {
                     let v = emit_bind_native(e, ctx, builder)?;
                     store_field(builder, block, off, Ty::Str, v);
+                } else if t.is_enum() {
+                    // v4.9：枚举元素按指针宽度存储（堆句柄）
+                    let (v, vt) = emit_expr(e, ctx, builder)?;
+                    let v = coerce(builder, v, vt, t)?;
+                    store_field(builder, block, off, t, v);
                 } else if t == Ty::F64 {
                     let (v, vt) = emit_expr(e, ctx, builder)?;
                     let v = coerce(builder, v, vt, Ty::F64)?;
@@ -2541,6 +3037,8 @@ fn emit_expr(
                     Ty::Tuple(_) => Err("元组不支持 tos/copy（应被 type_check 拦截）".into()),
                     // v4.7：map 不支持 tos/copy（应被 type_check 拦截）
                     Ty::Map(_) => Err("map 不支持 tos/copy（应被 type_check 拦截）".into()),
+                    // v4.9：枚举不支持 tos/copy（应被 type_check 拦截）
+                    Ty::Enum(_) => Err("枚举不支持 tos/copy（应被 type_check 拦截）".into()),
                 }
             }
         }
@@ -2564,6 +3062,62 @@ fn emit_expr(
             let offset = field_offset(idx);
             let v = load_field(builder, bptr, offset, ft)?;
             Ok((v, ft))
+        }
+        // v4.9：枚举构造 Json::Var / Json::Var(payload) —— __t_enum_new(tag, payload)
+        // 标量 payload 位模式塞 8 字节槽；f64 经 bitcast；str 经 emit_bind（字面量 dup）；容器/枚举/struct 移动进
+        Expr::EnumCtor {
+            en,
+            variant,
+            payload,
+            line: _,
+        } => {
+            let enum_tab = enums();
+            let ed = enum_tab
+                .get(*en as usize)
+                .ok_or("枚举类型索引越界（检查器已拦截）")?;
+            let vi = ed
+                .variants
+                .iter()
+                .position(|v| &v.name == variant)
+                .ok_or("枚举变体不存在（检查器已拦截）")?;
+            let mut parg = builder.ins().iconst(types::I64, 0);
+            if let (Some(pt), Some(pe)) = (ed.variants[vi].payload, payload) {
+                match pt {
+                    Ty::I32 | Ty::I64 => {
+                        let (v, vt) = emit_expr(pe, ctx, builder)?;
+                        parg = coerce(builder, v, vt, Ty::I64)?;
+                    }
+                    Ty::Bool => {
+                        let (v, vt) = emit_expr(pe, ctx, builder)?;
+                        let v = coerce(builder, v, vt, Ty::Bool)?;
+                        parg = builder.ins().uextend(types::I64, v);
+                    }
+                    Ty::F64 => {
+                        let (v, vt) = emit_expr(pe, ctx, builder)?;
+                        let v = coerce(builder, v, vt, Ty::F64)?;
+                        parg = builder.ins().bitcast(types::I64, MemFlags::new(), v);
+                    }
+                    Ty::Str => {
+                        let s = emit_bind_native(pe, ctx, builder)?;
+                        // str 源变量被移动：置空
+                        emit_move_nulls_native(pe, true, ctx, builder)?;
+                        parg = s;
+                    }
+                    _ => {
+                        let (v, vt) = emit_expr(pe, ctx, builder)?;
+                        parg = coerce(builder, v, vt, pt)?;
+                        // v4.9：容器/枚举/struct payload 移动进枚举后置空源（对齐 str 与 C 后端），
+                        // 否则源变量与枚举 payload 双持同一句柄 → 出口双重释放
+                        if is_owned(pt) {
+                            emit_move_nulls_native(pe, true, ctx, builder)?;
+                        }
+                    }
+                }
+            }
+            let tagv = builder.ins().iconst(types::I64, vi as i64);
+            let r = call_rt(ctx, builder, ctx.rt.enum_new, types::I64, 2, Some(ptr_ty()), &[tagv, parg])?
+                .ok_or("__t_enum_new 无返回值")?;
+            Ok((r, Ty::Enum(*en)))
         }
     }
 }

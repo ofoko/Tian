@@ -156,7 +156,8 @@ fn fmt_expr(e: &Expr, out: &mut String) {
         Expr::DArrLit { darr, elems } => {
             let table = crate::type_check::darrs();
             if let Some(d) = table.get(*darr as usize) {
-                out.push_str(&format!("[]{}", d.elem.label()));
+                // v4.9：元素递归 ty_str（枚举元素还原为枚举名）
+                out.push_str(&format!("[]{}", ty_str(d.elem)));
             }
             out.push('{');
             for (i, e) in elems.iter().enumerate() {
@@ -193,7 +194,8 @@ fn fmt_expr(e: &Expr, out: &mut String) {
         Expr::MapLit { map, entries } => {
             let minfo = crate::type_check::maps();
             if let Some(m) = minfo.get(*map as usize) {
-                out.push_str(&format!("map[{}]{}", m.key.label(), m.val.label()));
+                // v4.9：键/值递归 ty_str（map[str]Json 值还原为枚举名）
+                out.push_str(&format!("map[{}]{}", ty_str(m.key), ty_str(m.val)));
             } else {
                 out.push_str("map");
             }
@@ -249,6 +251,22 @@ fn fmt_expr(e: &Expr, out: &mut String) {
             out.push_str(", ");
             fmt_expr(key, out);
             out.push(')');
+        }
+        // v4.9：枚举构造 Json::Var / Json::Var(payload)（规范第 26 节）
+        Expr::EnumCtor { en, variant, payload, .. } => {
+            let ed = crate::type_check::enums();
+            let name = match ed.get(*en as usize) {
+                Some(e) => e.name.clone(),
+                None => "enum".into(),
+            };
+            out.push_str(&name);
+            out.push_str("::");
+            out.push_str(variant);
+            if let Some(p) = payload {
+                out.push('(');
+                fmt_expr(p, out);
+                out.push(')');
+            }
         }
     }
 }
@@ -366,6 +384,45 @@ fn fmt_stmt_inner(s: &Stmt, out: &mut String) {
             out.push('=');
             fmt_expr(value, out);
         }
+        // v4.9：match —— 语句级穷尽分派（规范第 26 节），多臂多行输出
+        Stmt::Match { scrutinee, arms, .. } => {
+            out.push_str("match ");
+            fmt_expr(scrutinee, out);
+            out.push_str("{\n");
+            for (i, arm) in arms.iter().enumerate() {
+                for (j, p) in arm.pats.iter().enumerate() {
+                    if j > 0 {
+                        out.push_str(" | ");
+                    }
+                    fmt_pat(p, out);
+                }
+                out.push_str(" => {\n");
+                for st in &arm.body {
+                    fmt_stmt(st, out, 2);
+                }
+                out.push_str("    }");
+                if i + 1 < arms.len() {
+                    out.push(',');
+                }
+                out.push('\n');
+            }
+            out.push('}');
+        }
+    }
+}
+
+/// match 模式：`_` / `Variant` / `Variant(bind)`（v4.9，规范第 26 节）
+fn fmt_pat(p: &Pat, out: &mut String) {
+    match p {
+        Pat::Wild => out.push('_'),
+        Pat::Variant { name, bind } => {
+            out.push_str(name);
+            if let Some(b) = bind {
+                out.push('(');
+                out.push_str(b);
+                out.push(')');
+            }
+        }
     }
 }
 
@@ -389,7 +446,8 @@ fn ty_str(t: Ty) -> String {
         Ty::DArr(i) => {
             let dt = crate::type_check::darrs();
             match dt.get(i as usize) {
-                Some(d) => format!("[]{}", d.elem.label()),
+                // v4.9：元素递归 ty_str（枚举元素需还原为枚举名，不能 .label()→"enum"）
+                Some(d) => format!("[]{}", ty_str(d.elem)),
                 None => "darr".into(),
             }
         }
@@ -411,12 +469,20 @@ fn ty_str(t: Ty) -> String {
                 None => "tuple".into(),
             }
         }
-        // v4.7：map 类型还原为 map[K]V（规范第 25 节）
+        // v4.7：map 类型还原为 map[K]V（规范第 25 节）；v4.9 值类型递归 ty_str（枚举值还原为枚举名）
         Ty::Map(i) => {
             let mt = crate::type_check::maps();
             match mt.get(i as usize) {
-                Some(m) => format!("map[{}]{}", m.key.label(), m.val.label()),
+                Some(m) => format!("map[{}]{}", ty_str(m.key), ty_str(m.val)),
                 None => "map".into(),
+            }
+        }
+        // v4.9：枚举类型还原为枚举名（规范第 26 节）
+        Ty::Enum(i) => {
+            let et = crate::type_check::enums();
+            match et.get(i as usize) {
+                Some(ed) => ed.name.clone(),
+                None => "enum".into(),
             }
         }
         other => other.label().to_string(),
@@ -430,6 +496,7 @@ pub fn format(prog: &Program) -> String {
     crate::type_check::set_darrs(&prog.darrs);
     crate::type_check::set_structs(&prog.structs);
     crate::type_check::set_maps(&prog.maps);
+    crate::type_check::set_enums(&prog.enums);
     let mut out = String::new();
     for u in &prog.uses {
         out.push_str(&format!("use {}\n", u));
@@ -448,6 +515,24 @@ pub fn format(prog: &Program) -> String {
         out.push_str("}\n");
     }
     if !prog.structs.is_empty() {
+        out.push('\n');
+    }
+    for ed in prog.enums.iter().filter(|e| !e.imported) {
+        out.push_str(&format!("enum {}{{", ed.name));
+        for (i, v) in ed.variants.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&v.name);
+            if let Some(p) = v.payload {
+                out.push('(');
+                out.push_str(&ty_str(p));
+                out.push(')');
+            }
+        }
+        out.push_str("}\n");
+    }
+    if !prog.enums.is_empty() {
         out.push('\n');
     }
     for f in prog.funcs.iter().filter(|f| !f.imported) {

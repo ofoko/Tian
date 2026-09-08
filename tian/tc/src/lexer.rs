@@ -33,6 +33,14 @@ pub enum Tok {
     Break,
     /// v3.8 进入下一轮循环
     Continue,
+    /// v4.9 枚举声明
+    Enum,
+    /// v4.9 枚举匹配
+    Match,
+    /// v4.9 match 臂 =>（胖箭头）
+    FatArrow,
+    /// v4.9 match 多模式 |
+    Pipe,
     /// 标识符（含中文）
     Ident(String),
     /// 整数字面量
@@ -99,6 +107,10 @@ impl fmt::Display for Tok {
             Tok::Use => write!(f, "use"),
             Tok::Break => write!(f, "break"),
             Tok::Continue => write!(f, "continue"),
+            Tok::Enum => write!(f, "enum"),
+            Tok::Match => write!(f, "match"),
+            Tok::FatArrow => write!(f, "=>"),
+            Tok::Pipe => write!(f, "|"),
             Tok::Ident(s) => write!(f, "标识符:{}", s),
             Tok::Int(n) => write!(f, "整数:{}", n),
             Tok::Float(v) => write!(f, "浮点:{}", v),
@@ -321,6 +333,8 @@ impl Lexer {
             '}' => Some(Tok::RBrace),
             ',' => Some(Tok::Comma),
             ':' => Some(Tok::Colon),
+            // v4.9：match 多模式分隔 |
+            '|' => Some(Tok::Pipe),
             // '=' '<' '>' '!' 走下方专门分支（可能构成 == / <= / >= / !=）
             _ => None,
         };
@@ -347,11 +361,15 @@ impl Lexer {
         }
 
         if c == '=' {
-            // = 或 ==
+            // => （match 臂，v4.9） 或 == 或 =
             self.bump();
             if self.peek() == Some('=') {
                 self.bump();
                 return Ok(Tok::Eq);
+            }
+            if self.peek() == Some('>') {
+                self.bump();
+                return Ok(Tok::FatArrow);
             }
             return Ok(Tok::Assign);
         }
@@ -485,6 +503,14 @@ impl Lexer {
         }
         if word == "continue" {
             return Ok(Tok::Continue);
+        }
+
+        // v4.9 保留字：enum / match（和类型，规范第 26 节）
+        if word == "enum" {
+            return Ok(Tok::Enum);
+        }
+        if word == "match" {
+            return Ok(Tok::Match);
         }
 
         // 转换/内建函数（标识符紧贴左括号时视为调用，此处仅记录名字）

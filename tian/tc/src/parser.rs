@@ -29,6 +29,7 @@ pub fn parse(toks: Vec<(Tok, usize)>) -> Result<Program, ParseError> {
         visited: std::collections::HashSet::new(),
         saved: Vec::new(),
         maps: Vec::new(),
+        enums: Vec::new(),
         // v4.7：预注册 keys() 结果的基础 darr 类型（[]str、[]i64；map 键仅限这两种，规范 25.4）
         darrs: Parser::seed_darrs(),
     }
@@ -58,6 +59,7 @@ pub fn parse_file(path: &str) -> Result<Program, ParseError> {
         visited: std::collections::HashSet::from([canon]),
         saved: Vec::new(),
         maps: Vec::new(),
+        enums: Vec::new(),
         darrs: Parser::seed_darrs(),
     };
     p.parse_program()
@@ -88,6 +90,8 @@ struct Parser {
     ret_stack: Vec<Ty>,
     // v4.7：关联数组类型表（按 (key,val) 去重）
     maps: Vec<MapDef>,
+    // v4.9：枚举类型表（占位先行入表实现递归自引用，按名字去重）
+    enums: Vec<EnumDef>,
 }
 
 impl Parser {
@@ -194,6 +198,8 @@ impl Parser {
                 Tok::Fn => prog.funcs.push(self.parse_fn()?),
                 // v3.0：顶层结构体声明（规范第 14 节）
                 Tok::Struct => prog.structs.push(self.parse_struct()?),
+                // v4.9：顶层枚举声明（和类型，规范第 26 节）
+                Tok::Enum => prog.enums.push(self.parse_enum()?),
                 // v3.6：use 导入（规范第 17 节）
                 Tok::Use => self.parse_use()?,
                 _ => prog.top.push(self.parse_stmt()?),
@@ -204,6 +210,7 @@ impl Parser {
         prog.darrs = std::mem::take(&mut self.darrs);
         prog.tuples = std::mem::take(&mut self.tuples);
         prog.maps = std::mem::take(&mut self.maps);
+        prog.enums = std::mem::take(&mut self.enums);
         prog.uses = std::mem::take(&mut self.uses);
         Ok(prog)
     }
@@ -283,6 +290,73 @@ impl Parser {
         let sd = StructDef { name, fields, line, imported: self.files.len() > 1 };
         self.structs.push(sd.clone());
         Ok(sd)
+    }
+
+    /// v4.9：标识符 → 已声明的枚举类型索引（None = 非枚举）
+    /// 枚举靠「占位先行入表」实现变体字段对自身的递归引用（规范第 26 节）。
+    fn named_enum(&self, name: &str) -> Option<Ty> {
+        self.enums
+            .iter()
+            .position(|e| e.name == name)
+            .map(|i| Ty::Enum(i as u32))
+    }
+
+    /// v4.9：enum Json{ Null, Bool(bool), Num(f64), Str(str), Arr([]Json), Obj(map[str]Json) }
+    /// 和类型声明（规范第 26 节）。先占位入表再解析 variants，使变体 payload 可递归引用自身。
+    fn parse_enum(&mut self) -> Result<EnumDef, ParseError> {
+        let line = self.line();
+        self.bump(); // enum
+        let name = self.expect_ident()?;
+        if self.enums.iter().any(|e| e.name == name) {
+            return Err(self.err(format!("枚举 '{}' 重复定义", name)));
+        }
+        if self.structs.iter().any(|s| s.name == name) {
+            return Err(self.err(format!("'{}' 与已声明的结构体重名", name)));
+        }
+        self.expect(&Tok::LBrace)?;
+        // ★ 占位先行入表：解析 variants 时 self.enums 已含自身条目 → []Json/map[str]Json 自引用成立
+        self.enums.push(EnumDef {
+            name: name.clone(),
+            variants: Vec::new(),
+            line,
+            imported: self.files.len() > 1,
+        });
+        let eid = (self.enums.len() - 1) as u32;
+        let mut variants = Vec::new();
+        self.skip_newlines();
+        while *self.peek() != Tok::RBrace {
+            if *self.peek() == Tok::Eof {
+                return Err(self.err("枚举未闭合（缺少 }）"));
+            }
+            let vline = self.line();
+            let vname = self.expect_ident()?;
+            if variants.iter().any(|v: &VariantDef| v.name == vname) {
+                return Err(self.err(format!("枚举 '{}' 的变体 '{}' 重复", name, vname)));
+            }
+            let payload = if *self.peek() == Tok::LParen {
+                self.bump();
+                let t = self.parse_type()?;
+                self.expect(&Tok::RParen)?;
+                Some(t)
+            } else {
+                None
+            };
+            variants.push(VariantDef {
+                name: vname,
+                payload,
+                line: vline,
+            });
+            if *self.peek() == Tok::Comma {
+                self.bump();
+            }
+            self.skip_newlines();
+        }
+        self.bump(); // }
+        if *self.peek() == Tok::Newline {
+            self.bump();
+        }
+        self.enums[eid as usize].variants = variants;
+        Ok(self.enums[eid as usize].clone())
     }
 
     /// v3.0：结构体字面量 Point{1,2} / Point{x:1,y:2}（规范 14.2）
@@ -663,6 +737,54 @@ impl Parser {
                     Ok(Stmt::Return(Some(e), start_line))
                 }
             }
+            Tok::Match => {
+                self.bump();
+                let scrutinee = self.parse_expr()?;
+                self.expect(&Tok::LBrace)?;
+                let mut arms = Vec::new();
+                self.skip_newlines();
+                while *self.peek() != Tok::RBrace {
+                    if *self.peek() == Tok::Eof {
+                        return Err(self.err("match 未闭合（缺少 }）"));
+                    }
+                    // 一臂含多模式：pat | pat | ... => body
+                    let mut pats = Vec::new();
+                    loop {
+                        pats.push(self.parse_pat()?);
+                        if *self.peek() == Tok::Pipe {
+                            self.bump();
+                            continue;
+                        }
+                        break;
+                    }
+                    self.expect(&Tok::FatArrow)?;
+                    self.skip_newlines();
+                    let body = if *self.peek() == Tok::LBrace {
+                        self.bump();
+                        self.parse_block()?
+                    } else {
+                        // 值臂：单个表达式语句（其值被丢弃，语句级 match）
+                        let e = self.parse_expr()?;
+                        self.expect_newline()?;
+                        vec![Stmt::Expr(e, start_line)]
+                    };
+                    arms.push(MatchArm { pats, body });
+                    self.skip_newlines();
+                    if *self.peek() == Tok::Comma {
+                        self.bump();
+                        self.skip_newlines();
+                    }
+                }
+                self.bump(); // }
+                if *self.peek() == Tok::Newline {
+                    self.bump();
+                }
+                Ok(Stmt::Match {
+                    scrutinee: Box::new(scrutinee),
+                    arms,
+                    line: start_line,
+                })
+            }
             Tok::Backtick => {
                 self.bump();
                 let e = self.parse_expr()?;
@@ -697,6 +819,39 @@ impl Parser {
         }
         self.tuples.push(TupleDef { elems: elems.clone() });
         Ty::Tuple((self.tuples.len() - 1) as u32)
+    }
+
+    /// v4.9：匹配模式（规范第 26 节）—— `_` 通配 / `Variant`（空 payload）/ `Variant(bind)`（绑定 payload）
+    fn parse_pat(&mut self) -> Result<Pat, ParseError> {
+        match self.peek().clone() {
+            Tok::Ident(n) if n == "_" => {
+                self.bump();
+                Ok(Pat::Wild)
+            }
+            Tok::Ident(n) => {
+                self.bump();
+                // v4.9：可选枚举前缀 Json::Variant（:: 词法宝成两个连排 Colon），
+                // scrutinee 类型已定枚举，前缀仅用于可读性，取最后之变体名
+                let mut name = n;
+                if *self.peek() == Tok::Colon
+                    && self.peek2().map_or(false, |t| *t == Tok::Colon)
+                {
+                    self.bump();
+                    self.bump();
+                    name = self.expect_ident()?;
+                }
+                let bind = if *self.peek() == Tok::LParen {
+                    self.bump();
+                    let b = self.expect_ident()?;
+                    self.expect(&Tok::RParen)?;
+                    Some(b)
+                } else {
+                    None
+                };
+                Ok(Pat::Variant { name, bind })
+            }
+            t => Err(self.err(format!("期望模式（_ 或 变体名），实际 '{}'", t))),
+        }
     }
 
     /// 类型标注：i32 / i64 / f64 / str / bool / &str（v2.1 借用）/ []T（v4.0）/ (T, T)（v4.5 元组）
@@ -746,6 +901,10 @@ impl Parser {
                 // v4.2：str 元素（push 移交所有权，容器深释放，规范 22.6）
                 "str" => Ty::Str,
                 other => {
+                    // v4.9：枚举可作为动态数组元素（[]Json 递归自引用，规范第 26 节）
+                    if let Some(et) = self.named_enum(other) {
+                        return Ok(self.darr_id(et));
+                    }
                     return Err(self.err(format!(
                         "动态数组元素类型须为 i32/i64/f64/bool/str（实际 '{}'）",
                         other
@@ -809,8 +968,12 @@ impl Parser {
                 if let Some(i) = self.structs.iter().position(|s| s.name == name) {
                     return Ok(Ty::Struct(i as u32));
                 }
+                // v4.9：已声明的枚举可作为类型（和类型，规范第 26 节）
+                if let Some(et) = self.named_enum(&name) {
+                    return Ok(et);
+                }
                 Err(self.err(format!(
-                    "未知类型 '{}'（可用：i32 i64 f64 str bool &str 或已声明的结构体名）",
+                    "未知类型 '{}'（可用：i32 i64 f64 str bool &str 或已声明的结构体/枚举名）",
                     name
                 )))
             }
@@ -859,6 +1022,10 @@ impl Parser {
             "bool" => Ty::Bool,
             "str" => Ty::Str,
             other => {
+                // v4.9：枚举可作为 map 值类型（map[str]Json 递归自引用，规范第 26 节）
+                if let Some(et) = self.named_enum(other) {
+                    return Ok(self.map_id(key, et));
+                }
                 return Err(self.err(format!(
                     "map 值类型须为 i32/i64/f64/bool/str（实际 '{}'）",
                     other
@@ -1064,6 +1231,34 @@ impl Parser {
                     return Ok(Expr::MapLit { map, entries });
                 }
                 self.bump();
+                // v4.9：Json::Str("x") / Json::Null 枚举构造（规范第 26 节）
+                // 语法：已声明的枚举名 + 两个连排冒号 + 变体名（[:: 词法器产出两个 Colon]）
+                if *self.peek() == Tok::Colon
+                    && self.peek2().map_or(false, |t| *t == Tok::Colon)
+                    && self.named_enum(&name).is_some()
+                {
+                    let en = match self.named_enum(&name) {
+                        Some(Ty::Enum(i)) => i,
+                        _ => unreachable!(),
+                    };
+                    self.bump(); // 第一个 :
+                    self.bump(); // 第二个 :
+                    let variant = self.expect_ident()?;
+                    let payload = if *self.peek() == Tok::LParen {
+                        self.bump();
+                        let e = self.parse_expr()?;
+                        self.expect(&Tok::RParen)?;
+                        Some(Box::new(e))
+                    } else {
+                        None
+                    };
+                    return Ok(Expr::EnumCtor {
+                        en,
+                        variant,
+                        payload,
+                        line,
+                    });
+                }
                 // v3.0：Point{...} 结构体字面量（调用与字段访问交给 parse_postfix）
                 // 仅当标识符是已声明的结构体名时才解析为结构体字面量；
                 // 否则按普通变量处理，{ 留给 while/if 等语句块解析器消费
@@ -1209,10 +1404,15 @@ impl Parser {
                     // v4.2：str 元素
                     "str" => Ty::Str,
                     other => {
-                        return Err(self.err(format!(
-                            "动态数组元素类型须为 i32/i64/f64/bool/str（实际 '{}'）",
-                            other
-                        )))
+                        // v4.9：枚举可作为动态数组字面量元素（[]Json 递归自引用，规范第 26 节）
+                        if let Some(et) = self.named_enum(other) {
+                            et
+                        } else {
+                            return Err(self.err(format!(
+                                "动态数组元素类型须为 i32/i64/f64/bool/str（实际 '{}'）",
+                                other
+                            )))
+                        }
                     }
                 };
                 let darr = match self.darr_id(elem) {

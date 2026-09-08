@@ -146,6 +146,18 @@ void __t_dfree_s(void* h) {
     for (long long i = 0; i < x->len; i++) free(((char**)__t_darr_data(h))[i]);
     free(h);
 }
+// v4.9：枚举元素动态数组（槽位存 void* 句柄；push 移动所有权，容器深释放回调 efree——规范第 26 节）
+void* __t_dpush_e(void* h, void* v) {
+    __t_darr_hdr* x = (__t_darr_hdr*)h;
+    if (x->len == x->cap) h = __t_dgrow(h);
+    ((void**)__t_darr_data(h))[((__t_darr_hdr*)h)->len] = v;
+    ((__t_darr_hdr*)h)->len++;
+    return h;
+}
+void* __t_dget_e(void* h, long long i) {
+    __t_dbound(h, i);
+    return ((void**)__t_darr_data(h))[i];
+}
 void* __t_dpush_i(void* h, long long v) {
     __t_darr_hdr* x = (__t_darr_hdr*)h;
     if (x->len == x->cap) h = __t_dgrow(h);
@@ -352,6 +364,18 @@ char* __t_mget_is(void* h, long long k) { __t_mnode* n = __t_mfind_i(h, k); if (
 long long __t_mget_si(void* h, const char* k) { __t_mnode* n = __t_mfind_s(h, k); if (!n) __t_panic("map 键不存在"); return n->val; }
 double __t_mget_sf(void* h, const char* k) { __t_mnode* n = __t_mfind_s(h, k); if (!n) __t_panic("map 键不存在"); double d; memcpy(&d, &n->val, 8); return d; }
 char* __t_mget_ss(void* h, const char* k) { __t_mnode* n = __t_mfind_s(h, k); if (!n) __t_panic("map 键不存在"); return (char*)n->val; }
+void* __t_mget_ie(void* h, long long k) { __t_mnode* n = __t_mfind_i(h, k); if (!n) __t_panic("map 键不存在"); return (void*)n->val; }
+void* __t_mget_se(void* h, const char* k) { __t_mnode* n = __t_mfind_s(h, k); if (!n) __t_panic("map 键不存在"); return (void*)n->val; }
+// map[i64]Enum：i64 键 + 枚举值逐元素回调深释放
+void __t_mfree_ie(void* h, void (*fr)(void*)) {
+    if (!h) return;
+    __t_map_hdr* x = (__t_map_hdr*)h;
+    for (long long i = 0; i < x->cap; i++) {
+        __t_mnode* n = __t_mbuckets(h)[i];
+        while (n) { __t_mnode* nx = n->next; if (n->val) fr((void*)n->val); free(n); n = nx; }
+    }
+    free(h);
+}
 
 // set：整体移动语义 → 返回新 h，调用方必须重绑（可能 realloc）。
 // str 键：调用方交付一份新副本，键已存在则消费（free）该副本、复用旧节点；不存在则接管新开节点。
@@ -407,6 +431,33 @@ void* __t_mset_ss(void* h, char* k, char* v) {
     __t_map_hdr* x = (__t_map_hdr*)h;
     __t_mnode* n = __t_mfind_s(h, k);
     if (n) { free(k); free((void*)n->val); n->val = (long long)v; return h; }
+    if ((x->len + 1) * 4 > x->cap * 3) { h = __t_mgrow(h); x = (__t_map_hdr*)h; }
+    long long hh = __t_mhash_s(k);
+    __t_mnode* nn = __t_mnode_new();
+    nn->hash = hh; nn->key = (long long)k; nn->val = (long long)v;
+    nn->next = __t_mbuckets(h)[hh & (x->cap - 1)];
+    __t_mbuckets(h)[hh & (x->cap - 1)] = nn;
+    x->len++;
+    return h;
+}
+// map[*]Enum：值按 void* 句柄存储；覆写旧值时经回调深释放；fr 为枚举深释放函数。
+void* __t_mset_ie(void* h, long long k, void* v, void (*fr)(void*)) {
+    __t_map_hdr* x = (__t_map_hdr*)h;
+    __t_mnode* n = __t_mfind_i(h, k);
+    if (n) { if (n->val) fr((void*)n->val); n->val = (long long)v; return h; }
+    if ((x->len + 1) * 4 > x->cap * 3) { h = __t_mgrow(h); x = (__t_map_hdr*)h; }
+    long long hh = __t_mhash_i(k);
+    __t_mnode* nn = __t_mnode_new();
+    nn->hash = hh; nn->key = k; nn->val = (long long)v;
+    nn->next = __t_mbuckets(h)[hh & (x->cap - 1)];
+    __t_mbuckets(h)[hh & (x->cap - 1)] = nn;
+    x->len++;
+    return h;
+}
+void* __t_mset_se(void* h, char* k, void* v, void (*fr)(void*)) {
+    __t_map_hdr* x = (__t_map_hdr*)h;
+    __t_mnode* n = __t_mfind_s(h, k);
+    if (n) { free(k); if (n->val) fr((void*)n->val); n->val = (long long)v; return h; }
     if ((x->len + 1) * 4 > x->cap * 3) { h = __t_mgrow(h); x = (__t_map_hdr*)h; }
     long long hh = __t_mhash_s(k);
     __t_mnode* nn = __t_mnode_new();
@@ -493,6 +544,34 @@ void __t_mfree_ss(void* h) {
     for (long long i = 0; i < x->cap; i++) {
         __t_mnode* n = __t_mbuckets(h)[i];
         while (n) { __t_mnode* nx = n->next; free((void*)n->key); free((void*)n->val); free(n); n = nx; }
+    }
+    free(h);
+}
+// ── v4.9 枚举与 match（规范第 26 节）──────────────────────────────
+// 枚举值 = 堆句柄 void* → 16 字节块 {long long tag; long long p;}（tag=变体下标，p=payload 槽）
+typedef struct { long long tag, p; } __t_enum_val;
+void* __t_enum_new(long long tag, long long p) {
+    __t_enum_val* e = (__t_enum_val*)__t_malloc(16);
+    e->tag = tag; e->p = p;
+    return e;
+}
+long long __t_enum_tag(void* e) { return ((__t_enum_val*)e)->tag; }
+
+// []Enum 动态数组逐元素回调深释放（元素是 void* 句柄）
+void __t_dfree_e(void* h, void (*fr)(void*)) {
+    if (!h) return;
+    __t_darr_hdr* x = (__t_darr_hdr*)h;
+    long long* b = (long long*)__t_darr_data(h);
+    for (long long i = 0; i < x->len; i++) if (b[i]) fr((void*)b[i]);
+    free(h);
+}
+// map[str]Enum：str 键 + 枚举值逐元素回调深释放
+void __t_mfree_se(void* h, void (*fr)(void*)) {
+    if (!h) return;
+    __t_map_hdr* x = (__t_map_hdr*)h;
+    for (long long i = 0; i < x->cap; i++) {
+        __t_mnode* n = __t_mbuckets(h)[i];
+        while (n) { __t_mnode* nx = n->next; free((void*)n->key); if (n->val) fr((void*)n->val); free(n); n = nx; }
     }
     free(h);
 }

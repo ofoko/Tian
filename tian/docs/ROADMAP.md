@@ -18,7 +18,7 @@
 2. `.bak-tuple-20260907-0912/` 移出仓库（基线建立后备份失去意义）。
 3. 落地一键验收脚本 `run_tests.sh`：cargo test → 双后端对拍 demo 套件（json/stats/heap/sieve/tuple）→ fmt 幂等检查。此后每版只跑这一个脚本。
 
-## 阶段一：数据结构补全（v4.6 – v4.8）
+## 阶段一：数据结构补全（v4.6 – v4.8）✅ **已收官（2026-09-08，v4.9 枚举与 match）**
 
 ### v4.6 元组生态收尾 + 验收工程化（小步快跑）
 
@@ -43,7 +43,9 @@
 - 天权：整体移动语义；str 键/值随容器深释放（`__t_map_free_s`，复用 `dfree_s` 先例）；借用 `&map[K]V` 只读视图随 v4.3 先例。
 - 狗粮：stats.t 从"单遍计数求和"升级为**按类目聚合**——这正是 v4.5 元组拍板时"消除两遍扫描"的下一站。
 
-### v4.8 枚举与 match（和类型）——阶段一压轴
+### v4.8 枚举与 match（和类型）——阶段一压轴 ✅ **已完成（2026-09-08）**
+
+> 落地要点：`enum` 声明 + `Name::Variant(...)` 构造 + `match` 穷尽匹配（位图覆盖/多模式 `|`/`_` 通配）；递归自引用占位注册；枚举作 `[]Enum` 元素与 `map[str|i64]Enum` 值（`__t_dpush_e`/`__t_dget_e`/`__t_dfree_e`、`__t_mset_se/ie`±efree 回调/`__t_mget_se/ie`/`__t_mfree_se/ie`），原生 efree 注册前置于函数编译；借用枚举 match 不释放包装句柄防双重释放。狗娘 `demo/json.t` → 真 AST（golden json_ast.t / enumfull.t），双后端 84/84 全绿。
 
 - 语法：`enum Json { Null, Bool(bool), Num(f64), Str(str), Arr([]Json), Obj(map[str]Json) }`；`match e { Num(n) => ..., _ => ... }`，**穷尽性检查**。
 - 物理：tag + payload 指针（间接存储，递归类型必需）；tag 走类型表 `ENUMS`；payload 槽复用 8 字节槽协议。
