@@ -1562,6 +1562,14 @@ pub fn ty_of<S: TyLookup>(
             }
             Ok(Ty::Enum(*en))
         }
+        // v5.0：内置泛型枚举构造应在解析期按期望类型物化为 EnumCtor；未物化则视为编译器错误告诫
+        Expr::GenericCtor { name, variant, line, .. } => Err(err(
+            *line,
+            format!(
+                "无法确定泛型枚举 '{}::{}' 的具体实例：请在变量声明标注类型，或使函数返回类型为 Result[...]/Option[...]",
+                name, variant
+            ),
+        )),
         // v3.7：sel(cond, a, b) —— 仅数值/bool 分支；类型按提升规则统一（规范第 18 节）
         Expr::Sel { cond, a, b } => {
             let ct = norm(ty_of(cond, scope, funcs, structs)?);
@@ -2446,6 +2454,14 @@ fn check_expr(
             }
             Ok(Ty::Enum(*en))
         }
+        // v5.0：内置泛型枚举构造亦由解析期物化/拒绝；未物化到达此处则报错
+        Expr::GenericCtor { name, variant, line: _, .. } => Err(err(
+            line,
+            format!(
+                "无法确定泛型枚举 '{}::{}' 的具体实例：请在变量声明标注类型，或使函数返回类型为 Result[...]/Option[...]",
+                name, variant
+            ),
+        )),
         Expr::Convert { name, arg } => {
             if name == "copy" {
                 // copy(s)/copy(&s)：只借用源变量，产生新的独立所有者（规范 11.2.4/11.2.5/11.6.4）

@@ -3,6 +3,29 @@
 use crate::ast::*;
 use crate::lexer::Tok;
 
+/// v5.0：泛型去重键（Ty 的稳定调试串；容器/枚举用索引即同一编译内稳定）
+fn generic_key(t: &Ty) -> String {
+    format!("{:?}", t)
+}
+
+/// v5.0：类型实参的用户可读名（供报错；容器给出可读形式）
+fn ty_arg_label(t: &Ty) -> String {
+    match t {
+        Ty::I32 => "i32".into(),
+        Ty::I64 => "i64".into(),
+        Ty::F64 => "f64".into(),
+        Ty::Str => "str".into(),
+        Ty::Bool => "bool".into(),
+        Ty::BorrowStr => "&str".into(),
+        Ty::Struct(_) => "struct".into(),
+        Ty::Arr(_) => "array".into(),
+        Ty::DArr(_) => "[...]".into(),
+        Ty::Tuple(_) => "(...)".into(),
+        Ty::Map(_) => "map[...]".into(),
+        Ty::Enum(_) => "enum".into(),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ParseError {
     pub msg: String,
@@ -659,7 +682,8 @@ impl Parser {
                     None
                 };
                 self.expect(&Tok::Assign)?;
-                let value = self.parse_expr()?;
+                let val = self.parse_expr()?;
+                let value = self.materialize_generic(val, ty, start_line)?;
                 self.expect_newline()?;
                 Ok(Stmt::Decl {
                     mutable,
@@ -734,6 +758,7 @@ impl Parser {
                         ));
                     }
                     self.expect_newline()?;
+                    let e = self.materialize_generic(e, self.ret_stack.last().copied(), start_line)?;
                     Ok(Stmt::Return(Some(e), start_line))
                 }
             }
@@ -964,6 +989,10 @@ impl Parser {
                 Ok(Ty::Str)
             }
             _ => {
+                // v5.0：内置泛型类型应用 Result[T,E] / Option[T] / Map[K,V]（规范第 28 节）
+                if Self::is_builtin_generic_type(&name) {
+                    return self.parse_generic_type_app(&name);
+                }
                 // v3.0：已声明的结构体可作为类型（必须先声明后使用）
                 if let Some(i) = self.structs.iter().position(|s| s.name == name) {
                     return Ok(Ty::Struct(i as u32));
@@ -1033,6 +1062,160 @@ impl Parser {
             }
         };
         Ok(self.map_id(key, val))
+    }
+
+    /// v5.0：是否是内置泛型类型构造器名（规范第 28 节）：Map / Result / Option
+    fn is_builtin_generic_type(name: &str) -> bool {
+        matches!(name, "Map" | "Result" | "Option")
+    }
+
+    /// v5.0：解析并物化内置泛型类型应用（单态化，规范第 28 节）
+    /// - Map[K,V]    → 既有 map_id（key∈{i64,str}，值任意拥有型）
+    /// - Result[T,E] → intern 具体枚举 {Ok(T), Err(E)}（hash-cons 去重）
+    /// - Option[T]   → intern 具体枚举 {Some(T), None}
+    fn parse_generic_type_app(&mut self, name: &str) -> Result<Ty, ParseError> {
+        let line = self.line();
+        if *self.peek() != Tok::LBracket {
+            return Err(self.err(format!(
+                "内置泛型 '{}' 需要类型实参，如 {}[]",
+                name,
+                match name {
+                    "Map" => "Map[K,V]",
+                    "Result" => "Result[T,E]",
+                    _ => "Option[T]",
+                }
+            )));
+        }
+        self.bump(); // [
+        let mut args = Vec::new();
+        while *self.peek() != Tok::RBracket {
+            if *self.peek() == Tok::Eof {
+                return Err(self.err(format!("泛型 '{}[' 未闭合（缺少 ]）", name)));
+            }
+            args.push(self.parse_type()?);
+            if *self.peek() == Tok::Comma {
+                self.bump();
+            }
+        }
+        self.expect(&Tok::RBracket)?;
+        match name {
+            "Map" => {
+                if args.len() != 2 {
+                    return Err(self.err(format!(
+                        "Map 需要 2 个类型实参 Map[K,V]（实际 {} 个）",
+                        args.len()
+                    )));
+                }
+                // 键限 i64/str（复用既有 map 约束，规范第 25 节）
+                if !matches!(args[0], Ty::I64 | Ty::Str) {
+                    return Err(self.err(format!(
+                        "Map 键类型须为 i64 或 str（实际 {}）",
+                        ty_arg_label(&args[0])
+                    )));
+                }
+                Ok(self.map_id(args[0], args[1]))
+            }
+            "Result" => {
+                if args.len() != 2 {
+                    return Err(self.err(format!(
+                        "Result 需要 2 个类型实参 Result[T,E]（实际 {} 个）",
+                        args.len()
+                    )));
+                }
+                self.generic_result_id(args[0], args[1], line)
+            }
+            "Option" => {
+                if args.len() != 1 {
+                    return Err(self.err(format!(
+                        "Option 需要 1 个类型实参 Option[T]（实际 {} 个）",
+                        args.len()
+                    )));
+                }
+                self.generic_option_id(args[0], line)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// v5.0：intern 具体 Result[T,E] 枚举 {Ok(T), Err(E)}（hash-cons 去重；规范第 28 节）
+    fn generic_result_id(&mut self, ok: Ty, err: Ty, line: usize) -> Result<Ty, ParseError> {
+        let name = format!("Result({},{})", generic_key(&ok), generic_key(&err));
+        for (i, e) in self.enums.iter().enumerate() {
+            if e.name == name {
+                return Ok(Ty::Enum(i as u32));
+            }
+        }
+        self.enums.push(EnumDef {
+            name: name.clone(),
+            variants: vec![
+                VariantDef { name: "Ok".into(), payload: Some(ok), line },
+                VariantDef { name: "Err".into(), payload: Some(err), line },
+            ],
+            line,
+            imported: true, // 内置类型：fmt 跳过（不写回源码），codegen 仍按索引生效
+        });
+        Ok(Ty::Enum((self.enums.len() - 1) as u32))
+    }
+
+    /// v5.0：intern 具体 Option[T] 枚举 {Some(T), None}（hash-cons 去重；规范第 28 节）
+    fn generic_option_id(&mut self, val: Ty, line: usize) -> Result<Ty, ParseError> {
+        let name = format!("Option({})", generic_key(&val));
+        for (i, e) in self.enums.iter().enumerate() {
+            if e.name == name {
+                return Ok(Ty::Enum(i as u32));
+            }
+        }
+        self.enums.push(EnumDef {
+            name: name.clone(),
+            variants: vec![
+                VariantDef { name: "Some".into(), payload: Some(val), line },
+                VariantDef { name: "None".into(), payload: None, line },
+            ],
+            line,
+            imported: true, // 内置类型：fmt 跳过
+        });
+        Ok(Ty::Enum((self.enums.len() - 1) as u32))
+    }
+
+    /// v5.0：把占位 GenericCtor（Result::Ok 等）按期望的 Result/Option 具体实例物化为 EnumCtor（规范第 28 节）。
+    /// 期望类型来自函数返回类型（Return）或变量声明的类型标注（Decl）；无期望类型则原样保留（type_check 报错）。
+    fn materialize_generic(&mut self, e: Expr, expected: Option<Ty>, line: usize) -> Result<Expr, ParseError> {
+        if !matches!(e, Expr::GenericCtor { .. }) {
+            return Ok(e);
+        }
+        let (name, variant, payload) = match &e {
+            Expr::GenericCtor { name, variant, payload, line: _ } => {
+                (name.clone(), variant.clone(), payload.clone())
+            }
+            _ => return Ok(e),
+        };
+        // 期望类型必须是某个具体 Result/Option 枚举实例
+        let ed = match expected {
+            Some(Ty::Enum(eid)) => self.enums.get(eid as usize).cloned(),
+            _ => None,
+        }
+        .ok_or_else(|| {
+            self.err(format!(
+                "无法确定泛型枚举 '{}::{}' 的具体实例：请在变量声明标注类型，或使函数返回类型为 Result[...]/Option[...]",
+                name, variant
+            ))
+        })?;
+        let is_result = ed.name.starts_with("Result(") && name == "Result";
+        let is_option = ed.name.starts_with("Option(") && name == "Option";
+        if !is_result && !is_option {
+            return Err(self.err(format!(
+                "泛型构造与期望类型不匹配：期望 '{}'，实际构造 '{}::{}'",
+                ed.name, name, variant
+            )));
+        }
+        if !ed.variants.iter().any(|v| v.name == variant) {
+            return Err(self.err(format!("泛型枚举 '{}' 没有变体 '{}'", ed.name, variant)));
+        }
+        let eid = match expected {
+            Some(Ty::Enum(id)) => id,
+            _ => unreachable!(),
+        };
+        Ok(Expr::EnumCtor { en: eid, variant, payload, line })
     }
 
     /// v3.3：类型后缀 [N] → 固定长度数组（仅值类型元素；str/结构体数组不支持）
@@ -1203,10 +1386,10 @@ impl Parser {
             }
             Tok::Ident(name) => {
                 let line = self.line();
-                // v4.7：map[K]V{ k1: v1, ... } 关联数组字面量（规范第 25 节）。
-                // 此处尚未 bump map 关键字，parse_map_type 会消费之。
-                if name == "map" && self.peek2() == Some(&Tok::LBracket) {
-                    let ty = self.parse_map_type()?;
+                // v4.7/v5.0：map[K]V{...} 或 Map[K,V]{...} 关联数组字面量（规范 25 节）
+                // 词法上形如 `<类型名> [ ... ] { ... }`，且类型是 map/map 泛型时即字面量。
+                if (name == "map" || name == "Map") && self.peek2() == Some(&Tok::LBracket) {
+                    let ty = self.parse_type()?;
                     let map = match ty {
                         Ty::Map(i) => i,
                         _ => unreachable!(),
@@ -1231,6 +1414,30 @@ impl Parser {
                     return Ok(Expr::MapLit { map, entries });
                 }
                 self.bump();
+                // v5.0：内置泛型枚举构造 Result::Ok(x) / Option::Some(x) / Option::None（规范第 28 节）
+                // 实例由期望类型在 Return/Decl 解析期物化；此处仅产出占位 GenericCtor
+                if *self.peek() == Tok::Colon
+                    && self.peek2().map_or(false, |t| *t == Tok::Colon)
+                    && Self::is_builtin_generic_type(&name)
+                {
+                    self.bump(); // 第一个 :
+                    self.bump(); // 第二个 :
+                    let variant = self.expect_ident()?;
+                    let payload = if *self.peek() == Tok::LParen {
+                        self.bump();
+                        let e = self.parse_expr()?;
+                        self.expect(&Tok::RParen)?;
+                        Some(Box::new(e))
+                    } else {
+                        None
+                    };
+                    return Ok(Expr::GenericCtor {
+                        name,
+                        variant,
+                        payload,
+                        line,
+                    });
+                }
                 // v4.9：Json::Str("x") / Json::Null 枚举构造（规范第 26 节）
                 // 语法：已声明的枚举名 + 两个连排冒号 + 变体名（[:: 词法器产出两个 Colon]）
                 if *self.peek() == Tok::Colon

@@ -255,11 +255,31 @@ fn fmt_expr(e: &Expr, out: &mut String) {
         // v4.9：枚举构造 Json::Var / Json::Var(payload)（规范第 26 节）
         Expr::EnumCtor { en, variant, payload, .. } => {
             let ed = crate::type_check::enums();
-            let name = match ed.get(*en as usize) {
+            let raw = match ed.get(*en as usize) {
                 Some(e) => e.name.clone(),
                 None => "enum".into(),
             };
+            // v5.0：内置泛型枚举（Result/Option）的规范名是 Result(T,E)/Option(T)，
+            // 写出源码语法应还原为用户可见的 Result/Option（构造恒为 Result::Ok 等，规范第 28 节）
+            let name = if raw.starts_with("Result(") {
+                "Result".to_string()
+            } else if raw.starts_with("Option(") {
+                "Option".to_string()
+            } else {
+                raw
+            };
             out.push_str(&name);
+            out.push_str("::");
+            out.push_str(variant);
+            if let Some(p) = payload {
+                out.push('(');
+                fmt_expr(p, out);
+                out.push(')');
+            }
+        }
+        // v5.0：未物化的泛型构造（应被解析期物化/拒绝）；形式化输出以保幂等
+        Expr::GenericCtor { name, variant, payload, .. } => {
+            out.push_str(name);
             out.push_str("::");
             out.push_str(variant);
             if let Some(p) = payload {
@@ -477,10 +497,19 @@ fn ty_str(t: Ty) -> String {
                 None => "map".into(),
             }
         }
-        // v4.9：枚举类型还原为枚举名（规范第 26 节）
+        // v4.9：枚举类型还原为枚举名（规范第 26 节）；v5.0 内置泛型还原为 Result[T,E]/Option[T]
         Ty::Enum(i) => {
             let et = crate::type_check::enums();
             match et.get(i as usize) {
+                Some(ed) if ed.name.starts_with("Result(") => {
+                    let ok = ed.variants.get(0).and_then(|v| v.payload).unwrap_or(Ty::I64);
+                    let err = ed.variants.get(1).and_then(|v| v.payload).unwrap_or(Ty::I64);
+                    format!("Result[{},{}]", ty_str(ok), ty_str(err))
+                }
+                Some(ed) if ed.name.starts_with("Option(") => {
+                    let val = ed.variants.get(0).and_then(|v| v.payload).unwrap_or(Ty::I64);
+                    format!("Option[{}]", ty_str(val))
+                }
                 Some(ed) => ed.name.clone(),
                 None => "enum".into(),
             }

@@ -1866,6 +1866,8 @@ fn emit_expr(e: &Expr, scope: &Scope, sigs: &HashMap<String, FuncSig>, out: &mut
         Expr::Pop { .. } => unreachable!("pop 只能作为语句（检查器已拦截）"),
         Expr::Del { .. } => unreachable!("del 只能作为语句（检查器已拦截）"),
         Expr::Sort { .. } => unreachable!("sort 只能作为语句（检查器已拦截）"),
+        // v5.0：未物化的泛型枚举构造到不了代码生成（type_check 已拒绝/解析期已物化）
+        Expr::GenericCtor { .. } => unreachable!("内部错误：未物化的泛型构造到达代码生成"),
         Expr::DArrLit { .. } => unreachable!("动态数组字面量位置非法（检查器已拦截）"),
         // v3.7：sel(条件, a, b) → C 三元表达式（惰性求值，与原生后端一致，规范第 18 节）
         Expr::Sel { cond, a, b } => {            out.push_str("((");

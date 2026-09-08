@@ -293,6 +293,15 @@ pub enum Expr {
         payload: Option<Box<Expr>>,
         line: usize,
     },
+    /// v5.0 内置泛型枚举构造：Result::Ok(x) / Result::Err(e) / Option::Some(x) / Option::None（规范第 28 节）
+    /// 实例在解析期按「期望类型」物化为具体 EnumCtor（Return 用函数返回类型、Decl 用类型标注）；
+    /// 未物化（无期望类型）者由 type_check 报错（需类型标注）。
+    GenericCtor {
+        name: String,
+        variant: String,
+        payload: Option<Box<Expr>>,
+        line: usize,
+    },
 }
 
 /// 语句（line 用于报错定位）

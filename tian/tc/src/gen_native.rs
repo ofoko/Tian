@@ -1939,6 +1939,8 @@ fn emit_ty_of(e: &Expr, ctx: &FnCtx) -> Option<Ty> {
         Expr::Cat { .. } => Some(Ty::Str),
         // v4.9：枚举构造类型 = 枚举索引
         Expr::EnumCtor { en, .. } => Some(Ty::Enum(*en)),
+        // v5.0：未物化的泛型构造到不了此（type_check 已拒绝）
+        Expr::GenericCtor { .. } => None,
         // v4.5：元组表达式类型 = Ty::Tuple(tup)
         Expr::TupExpr { tup, .. } => Some(Ty::Tuple(*tup)),
         Expr::Push { .. } => None,
@@ -3119,5 +3121,7 @@ fn emit_expr(
                 .ok_or("__t_enum_new 无返回值")?;
             Ok((r, Ty::Enum(*en)))
         }
+        // v5.0：未物化的泛型枚举构造到不了代码生成（type_check 已拒绝/解析期已物化）
+        Expr::GenericCtor { .. } => Err("内部错误：未物化的泛型构造到达代码生成".into()),
     }
 }
